@@ -5046,7 +5046,12 @@ int nvn_front_tex_changed(Tex *t) {
     if (!t->b.packaged && t->limit && src + t->data_size > t->limit) return 0;
     if (t->b.packaged && t->uploaded) return 0;
     LONG64 pf0 = pf_now();
-    uint64_t newest = ww_newest(src, t->data_size);
+    /* session 12: a small texture is hashed (every word) instead of asking the write watch: one GetWriteWatch call took about
+     * 5 us on the render thread (85-90 texture checks per frame in a heavy fight, half of them 10 KB or less), the hash of
+     * 16 KB about 2 us. SSBU_WW_SMALL=<bytes> sets the limit (0 = the write watch for every size, as before). */
+    static long ww_small = -1;
+    if (ww_small < 0) ww_small = getenv("SSBU_WW_SMALL") ? atol(getenv("SSBU_WW_SMALL")) : 16384;
+    uint64_t newest = t->data_size <= (uint64_t)ww_small ? 0 : ww_newest(src, t->data_size);
     if (newest) {
         if (t->uploaded && !t->dirty && t->ww_hashed && newest <= t->ww_seen) { g_ww_clean++; pf_add(PF_TEXHASH, pf0); return 0; }
         t->ww_seen = newest;

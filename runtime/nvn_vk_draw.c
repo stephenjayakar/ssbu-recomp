@@ -249,11 +249,18 @@ static void slot_wait(Slot *s) {
     if (s->serial > R.done) R.done = s->serial;
 }
 static void garbage_collect(void);
-static uint32_t g_tset_gen = 1;                   /* texture descriptor sets live as long as the command buffer whose pools they come from */
+static int g_ngarbage;
+static uint32_t g_tset_gen = 1;                   /* the texture descriptor set cache (g_tset): entries of another generation are free */
 static int g_tset_used, g_tset_list_used;
+static int g_tsf_on = -1;                          /* session 12: texture sets from the per-frame pools (ts_alloc); 0 = SSBU_VK_TSFRAME=0: per command buffer as before */
+static LONG64 g_tset_forgets, g_ts_flush_n[3];
+static int g_ts_dirty;                            /* images were destroyed since the texture set cache was last emptied */
+static void ts_next(void);
+static void tset_forget(void) { g_tset_gen++; g_tset_used = 0; g_tset_list_used = 0; g_tset_forgets++; }
 static void cmd_begin(void) {
     if (R.recording) return;
-    g_tset_gen++; g_tset_used = 0; g_tset_list_used = 0;
+    if (g_tsf_on < 0) g_tsf_on = !(getenv("SSBU_VK_TSFRAME") && !atoi(getenv("SSBU_VK_TSFRAME")));
+    if (!g_tsf_on) tset_forget();
     R.cur = (R.cur + 1) % NSLOT;
     Slot *s = &R.slot[R.cur];
     slot_wait(s);
@@ -270,7 +277,8 @@ static void cmd_begin(void) {
     }
     s->ts_frame = g_cur_frame;
     if (g_ts_on > 0) { vkCmdResetQueryPool(s->cmd, g_ts_pool, (uint32_t)R.cur * 2, 2); vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_ts_pool, (uint32_t)R.cur * 2); }
-    garbage_collect();
+    if (g_tsf_on <= 0) garbage_collect();
+    else if (g_ngarbage > 512) { garbage_collect(); if (g_ts_dirty) { g_ts_flush_n[0]++; ts_next(); } }      /* texture sets kept: images go once a frame (ts_frame_end), or here when many wait (long held loading screens) */
 }
 /* Ends the command buffer being recorded and gives it to the queue. Returns its number (the last one when nothing was recorded). */
 static void acopy_flush(void);
@@ -535,7 +543,7 @@ static void wintex_note(Tex *t) { if (!t || wintex_is(t)) return; for (int i = 0
 static int rs_ui_native(void) { static int on = -1; if (on < 0) on = getenv("SSBU_VK_UI_NATIVE") && atoi(getenv("SSBU_VK_UI_NATIVE")); return on; }
 static VTex *g_vtex_all;
 static struct { VTex *vt; uint64_t serial; } *g_garbage;
-static int g_ngarbage, g_garbage_cap;
+static int g_garbage_cap;
 static VkFlags layout_access(VkImageLayout l) {
     switch (l) {
     case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: return VK_ACCESS_TRANSFER_WRITE_BIT; case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: return VK_ACCESS_TRANSFER_READ_BIT;
@@ -574,6 +582,7 @@ static void garbage_collect(void) {
     int n = 0;
     LONG64 t0 = g_ngarbage ? tk() : 0;
     for (int i = 0; i < g_ngarbage; i++) if (g_garbage[i].serial <= R.done) vt_destroy(g_garbage[i].vt); else g_garbage[n++] = g_garbage[i];
+    if (n != g_ngarbage) { if (g_tsf_on > 0) g_ts_dirty = 1; else tset_forget(); }      /* a cached texture set may name a view of a destroyed image (and a new view may get its handle): the cache is emptied before the next draw */
     if (t0 && g_ngarbage - n >= 50) {              /* session 8: what destroying many images at once costs (the end of a screen) */
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         double ms = (double)(tk() - t0) * 1000.0 / (double)fq.QuadPart;
@@ -1347,6 +1356,55 @@ static VkDescriptorSet set_alloc(VkDescriptorSetLayout layout) {
         VKC(vkCreateDescriptorPool(V.device, &pi, NULL, &s->pool[s->npool++]));
     }
 }
+/* Session 12: texture sets (set 1 of a draw) are kept from frame to frame. Each set lived as long as its command buffer
+ * (a new one every 32 draws, SSBU_VK_SPLIT): measured in a heavy fight (gaogaen / bayonetta, Midgar) 600-650 sets made and
+ * written per frame of about 930 asked for, and a cache per frame found no more than the cache per buffer: the lists repeat
+ * from frame to frame, not within one. A set never changes after it is written, so it stays valid while the views it names
+ * exist: the sets now come from pools of their own (a group of pools, TS_N groups used in turn) and the cache is emptied
+ * only when images were destroyed (once a frame at most: ts_frame_end destroys them), when it is full, or when its group
+ * of pools is (ts_next). A group is reset only when every command buffer recorded while it was in use has finished. */
+#define TS_N 4
+typedef struct { VkDescriptorPool pool[64]; int npool, ipool; uint64_t end; } TSG;
+static TSG g_tsg[TS_N];
+static int g_tsg_cur;
+static LONG64 g_tsg_waits;
+static void ts_next(void) {                        /* the next group: its frame's command buffers must have finished */
+    g_tsg[g_tsg_cur].end = R.serial + (R.recording ? 1u : 0u);
+    g_tsg_cur = (g_tsg_cur + 1) % TS_N;
+    uint64_t need = g_tsg[g_tsg_cur].end;
+    if (need > R.serial) cmd_submit(NULL, NULL);
+    if (R.done < need) { g_tsg_waits++; for (int i = 0; i < NSLOT; i++) if (R.slot[i].pending && R.slot[i].serial <= need) slot_wait(&R.slot[i]); if (R.done < need) R.done = need; }
+    for (int i = 0; i < g_tsg[g_tsg_cur].npool; i++) VKC(vkResetDescriptorPool(V.device, g_tsg[g_tsg_cur].pool[i], 0));
+    g_tsg[g_tsg_cur].ipool = 0;
+    tset_forget(); g_ts_dirty = 0;
+}
+static void ts_frame_end(void) {
+    if (g_tsf_on <= 0) return;
+    garbage_collect();                             /* images whose last use has finished */
+    if (g_ts_dirty) { g_ts_flush_n[0]++; ts_next(); }
+    else if (g_tset_used >= 3400 || g_tset_list_used >= 30000) { g_ts_flush_n[1]++; ts_next(); }
+}
+static VkDescriptorSet ts_alloc(VkDescriptorSetLayout layout) {
+    if (g_tsf_on <= 0) return set_alloc(layout);
+    for (;;) {
+        TSG *g = &g_tsg[g_tsg_cur];
+        if (g->ipool < g->npool) {
+            VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            VkDescriptorSet set;
+            ai.descriptorPool = g->pool[g->ipool]; ai.descriptorSetCount = 1; ai.pSetLayouts = &layout;
+            VkResult r = vkAllocateDescriptorSets(V.device, &ai, &set);
+            if (r == VK_SUCCESS) { R.sets++; return set; }
+            if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL) vk_fatal("vkAllocateDescriptorSets", r);
+            g->ipool++;
+            continue;
+        }
+        if (g->npool == 64) { g_ts_flush_n[2]++; ts_next(); continue; }      /* the group is full: the next one (its cache starts empty) */
+        VkDescriptorPoolSize ps[1] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768}};
+        VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pi.maxSets = 4096; pi.poolSizeCount = 1; pi.pPoolSizes = ps;
+        VKC(vkCreateDescriptorPool(V.device, &pi, NULL, &g->pool[g->npool++]));
+    }
+}
 static struct { uint64_t key; VkDescriptorSet set; uint32_t gen; VkDescriptorSetLayout dl; int n, off; } g_tset[4096];      /* texture sets of the command buffer being recorded */
 static struct { VTex *d2, *d1, *d3; VkImageView v[7]; } g_dummy;
 static struct { VkImageView view; VkSampler smp; VkImageLayout layout; } g_dtex[140], g_tset_list[32768];      /* g_tset_list: the lists of the cached sets, for the full comparison */
@@ -1654,6 +1712,17 @@ static CB *cb_new(uint64_t addr, uint64_t size) {
     return c;
 }
 typedef struct { uint64_t off, size; int zero; VkBuffer buf; } BufRef;
+/* Session 12: the size table of a stage (c2, 896 bytes) went into the ring at every draw; it changes only when textures are
+ * bound with other sizes, so it is put there again only then or in a new generation of the ring (data of a generation stays
+ * where it is until the generation ends). */
+static uint64_t g_c2_off[6];
+static uint32_t g_c2_gen[6];                       /* R.gen when g_c2_off was written; 0 = the table changed since */
+static uint64_t c2_put(int s) {
+    if (g_c2_gen[s] && g_c2_gen[s] == R.gen) return g_c2_off[s];
+    g_scat = s == 5 ? 6 : 0;
+    g_c2_off[s] = ring_raw(R.c2[s], sizeof R.c2[s]); g_c2_gen[s] = R.gen;
+    return g_c2_off[s];
+}
 /* Where a command reads the guest range from: a CB of this batch that contains it, else the stream ring. align: the offset
  * alignment the use needs (storage descriptors), 1 = none. Returns 1 when a CB is bound. */
 static int buf_ref(uint64_t addr, uint64_t size, uint64_t align, BufRef *b) {
@@ -1736,7 +1805,7 @@ static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uin
             if (!(v->cbufs >> n & 1)) continue;
             BufRef *b = &bufs[nbuf++];
             b->zero = 0; b->buf = R.ring;
-            if (n == 2) { g_scat = 6; b->off = ring_raw(R.c2[5], sizeof R.c2[5]); b->size = sizeof R.c2[5]; }
+            if (n == 2) { b->off = c2_put(5); b->size = sizeof R.c2[5]; }
             else if (n == 1 && st->ctl[3] && st->ctl[4]) { b->size = st->ctl[3]; b->off = ring_put((uint64_t)(uintptr_t)(st->code + st->ctl[4]), b->size); }
             else if (n >= 3 && R.ubo[5][n - 3].addr && R.ubo[5][n - 3].size) { g_scat = 6; buf_ref(R.ubo[5][n - 3].addr, R.ubo[5][n - 3].size, al, b); }
             else b->zero = 1;                      /* c0 outside the storage descriptors, or nothing bound: zeros (OpenGL: nothing bound) */
@@ -1845,7 +1914,7 @@ static int draw_prepare(unsigned prim) {
             if (!(v->cbufs >> n & 1)) continue;
             BufRef *b = &bufs[nbuf++];
             b->zero = 0; b->buf = R.ring;
-            if (n == 2) { g_scat = 0; b->off = ring_raw(R.c2[s], sizeof R.c2[s]); b->size = sizeof R.c2[s]; }
+            if (n == 2) { b->off = c2_put(s); b->size = sizeof R.c2[s]; }
             else if (n == 1 && st->ctl[3] && st->ctl[4]) { b->size = st->ctl[3]; g_scat = 1; b->off = ring_put((uint64_t)(uintptr_t)(st->code - 0x30 + st->ctl[4]), b->size); }
             else if (n >= 3 && R.ubo[s][n - 3].addr && R.ubo[s][n - 3].size) { g_scat = 2; buf_ref(R.ubo[s][n - 3].addr, R.ubo[s][n - 3].size, sal, b); }
             else b->zero = 1;
@@ -1883,7 +1952,12 @@ static int draw_prepare(unsigned prim) {
         memcpy(k.blend, R.blend, sizeof k.blend);
     }
     pkey_targets(&k);
-    Pipe *p = pipe_get(&k, vs, fs);
+    /* session 12: the pipeline of the previous draw when the key is the same (no hash, no lock); a pipeline that is made and
+     * used once stays as it is (pipe_get would return it unchanged) */
+    static PKey last_k;
+    static Pipe *last_p;
+    Pipe *p = last_p && last_p->state == 2 && last_p->used && !memcmp(&k, &last_k, sizeof k) ? last_p : pipe_get(&k, vs, fs);
+    if (p && p != last_p) { last_k = k; last_p = p; }
     if (!p) return 0;                             /* shader_wait = skip: the pipeline is being made by a worker, the draw is left out (counted in pipe_get) */
     if (!R.pipe_bound) R.dyn3_dirty = 1;          /* a new command buffer, or a pipeline of our own with static state was bound */
     if (R.pipe_bound != p) { vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->p); R.pipe_bound = p; }
@@ -1969,7 +2043,9 @@ static int draw_prepare(unsigned prim) {
             if (hit) { sets[1] = g_tset[slot].set; R.sets_reused++; }
             else {
                 int n1 = 0;
-                sets[1] = set_alloc(p->dl[1]);
+                uint32_t gen0 = g_tset_gen;
+                sets[1] = ts_alloc(p->dl[1]);
+                if (gen0 != g_tset_gen) slot = 4096;       /* the group changed: the cache was emptied, the probe above is void */
                 for (int s = 0; s < (fs ? 2 : 1); s++) {
                     VStage *v = s ? fs : vs;
                     for (int i = 0; i < v->nsmp; i++) {
@@ -1980,7 +2056,7 @@ static int draw_prepare(unsigned prim) {
                     }
                 }
                 vkUpdateDescriptorSets(V.device, (uint32_t)n1, w, 0, NULL);
-                if (slot < 4096 && g_tset_used < 3000 && g_tset_list_used + g_ndtex <= (int)(sizeof g_tset_list / sizeof g_tset_list[0])) {
+                if (slot < 4096 && g_tset_used < 3500 && g_tset_list_used + g_ndtex <= (int)(sizeof g_tset_list / sizeof g_tset_list[0])) {
                     g_tset[slot].key = key; g_tset[slot].set = sets[1]; g_tset[slot].gen = g_tset_gen; g_tset[slot].dl = p->dl[1]; g_tset[slot].n = g_ndtex; g_tset[slot].off = g_tset_list_used;
                     memcpy(&g_tset_list[g_tset_list_used], g_dtex, sizeof g_dtex[0] * (size_t)g_ndtex);
                     g_tset_list_used += g_ndtex; g_tset_used++;
@@ -2266,7 +2342,7 @@ static void exec(const Cmd *m, int depth) {
                 if (((nf >= 1 && nf <= 0x30) || (nf >= 0x6D && nf <= 0x78)) && (k == 2 || k == 3 || k == 7 || k == 8 || k == 10 || k == 11)) isint = k == 3 || k == 8 || k == 11 ? 2 : 1;
                 if (nf == 0x3E) isint = 1;
             }
-            memcpy(&R.c2[stage][48 + 2 * u], dims, 16);
+            if (memcmp(&R.c2[stage][48 + 2 * u], dims, 16)) { memcpy(&R.c2[stage][48 + 2 * u], dims, 16); g_c2_gen[stage] = 0; }
             R.tex_int[stage] = (R.tex_int[stage] & ~(1u << u)) | ((uint32_t)(isint != 0) << u);
             R.tex_sint[stage] = (R.tex_sint[stage] & ~(1u << u)) | ((uint32_t)(isint == 2) << u);
         }
@@ -2723,6 +2799,7 @@ static void vk_present2(void *arg, int progress) {
         if (wt > 0 && frame == wt && !progress) { printf("nvn_vk_watchdog: TEST: the render thread is held %d s at frame %lld (SSBU_VK_WD_TEST)\n", ws, (long long)frame); fflush(stdout); wt = -1; Sleep((DWORD)ws * 1000); }
     }
     if (progress) goto swap;
+    ts_frame_end();
     if (j->win) for (int i = 0; i < j->win->count && i < 8; i++) wintex_note(j->win->tex[i]);
     g_ovl.bar_arg = arg;
     g_wd_where = 1;
@@ -2900,8 +2977,8 @@ handed:
                    (g_sb_stale - stl) / 307200.0, (g_genb[0] - gl[0]) / 300.0, (g_genb[1] - gl[1]) / 300.0, (g_genb[2] - gl[2]) / 300.0, (g_genb[3] - gl[3]) / 300.0, (g_genb[4] - gl[4]) / 300.0, (g_genb[5] - gl[5]) / 300.0, (R.cb_bytes - cbl) / 307200.0, (long long)g_rch_waits, (double)g_rch_wait_tk * 1000.0 / (double)fq.QuadPart, (long long)g_rch_drains, (long long)g_acq_jobs, (double)g_acq_bytes / 1048576.0, (double)g_acq_wait_tk * 1000.0 / (double)fq.QuadPart);
             memcpy(sl, g_sb, sizeof sl); stl = g_sb_stale; memcpy(gl, g_genb, sizeof gl); cbl = R.cb_bytes; }
         if (g_dpstat > 0) { static LONG64 dl[8];
-            printf("nvn_vk_dprep: frames %lld..%lld ms/frame: stages %.2f, textures %.2f, buffers %.2f, pass + pipeline + state %.2f, vertex input %.2f, descriptors %.2f, push constants %.2f\n", (long long)frame - 300, (long long)frame,
-                   (g_dp[0] - dl[0]) * k, (g_dp[1] - dl[1]) * k, (g_dp[2] - dl[2]) * k, (g_dp[3] - dl[3]) * k, (g_dp[4] - dl[4]) * k, (g_dp[5] - dl[5]) * k, (g_dp[6] - dl[6]) * k);
+            printf("nvn_vk_dprep: frames %lld..%lld ms/frame: stages %.2f, textures %.2f, buffers %.2f, pass + pipeline + state %.2f, vertex input %.2f, descriptors %.2f, push constants %.2f | texture set cache emptied %lld times so far (images destroyed %lld, cache full %lld, pools full %lld), %lld group waits\n", (long long)frame - 300, (long long)frame,
+                   (g_dp[0] - dl[0]) * k, (g_dp[1] - dl[1]) * k, (g_dp[2] - dl[2]) * k, (g_dp[3] - dl[3]) * k, (g_dp[4] - dl[4]) * k, (g_dp[5] - dl[5]) * k, (g_dp[6] - dl[6]) * k, (long long)g_tset_forgets, (long long)g_ts_flush_n[0], (long long)g_ts_flush_n[1], (long long)g_ts_flush_n[2], (long long)g_tsg_waits);
             memcpy(dl, g_dp, sizeof dl); }
         if (frame % 3000 == 0) m4_report();
         memcpy(last, g_tm, sizeof last); last_sets = R.sets; last_flush = R.flushes; last_reused = R.sets_reused; last_disp = R.dispatches;
@@ -3163,6 +3240,7 @@ static void vkd_shutdown(void) {
     vkDestroySampler(V.device, g_smp_default, NULL);
     if (g_ts_pool) { vkDestroyQueryPool(V.device, g_ts_pool, NULL); g_ts_pool = NULL; g_ts_on = 0; }
     for (int i = 0; i < NSLOT; i++) { for (int k = 0; k < R.slot[i].npool; k++) vkDestroyDescriptorPool(V.device, R.slot[i].pool[k], NULL); vkDestroyFence(V.device, R.slot[i].fence, NULL); }
+    for (int i = 0; i < TS_N; i++) { for (int k = 0; k < g_tsg[i].npool; k++) vkDestroyDescriptorPool(V.device, g_tsg[i].pool[k], NULL); g_tsg[i].npool = 0; }
     vkDestroyBuffer(V.device, R.ring, NULL); vkDestroyBuffer(V.device, R.zero, NULL);
     for (int b = 0; b < g_nblk; b++) if (g_blk[b]) { vkFreeMemory(V.device, g_blk[b]->mem, NULL); free(g_blk[b]); g_blk[b] = NULL; }
     R.ring = NULL;
