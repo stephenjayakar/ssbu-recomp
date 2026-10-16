@@ -23,7 +23,7 @@ static int have_targets_live(void);
     X(vkCmdSetBlendConstants) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetStencilReference) X(vkCmdSetLineWidth) X(vkCmdSetCullMode) X(vkCmdSetFrontFace) \
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp) X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) \
     X(vkCmdSetDepthBiasEnable) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetRasterizerDiscardEnable) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdDraw) X(vkCmdDrawIndexed) \
-    X(vkCmdClearAttachments) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdBlitImage) X(vkCmdResolveImage) X(vkCmdClearDepthStencilImage) X(vkGetFenceStatus) \
+    X(vkCmdClearAttachments) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdBlitImage) X(vkCmdResolveImage) X(vkCmdClearDepthStencilImage) X(vkGetFenceStatus) \
     X(vkCreateComputePipelines) X(vkCmdDispatch) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) X(vkCreatePipelineCache) X(vkGetPipelineCacheData) X(vkDestroyPipelineCache)
 #define X(n) static PFN_##n n;
 VKD(X)
@@ -116,6 +116,7 @@ typedef struct { VkDeviceMemory mem; uint64_t size; void *map; uint32_t type; in
 static VBlock *g_blk[2048];
 static int g_nblk;
 static LONG64 g_mem_total, g_mem_leak;
+static int g_vmem_soft;                            /* vmem_alloc returns block -1 instead of failing */
 static VMem vmem_alloc(VkMemoryRequirements rq, VkFlags want, int cls) {
     VMem m = {-1, 0, 0, NULL, NULL};
     uint32_t type = 32;
@@ -147,6 +148,7 @@ static VMem vmem_alloc(VkMemoryRequirements rq, VkFlags want, int cls) {
         k->size = rq.size > (16u << 20) ? rq.size : (64u << 20); k->type = type; k->cls = rq.size > (16u << 20) ? 100 + b : cls;      /* large: a block of its own */
         ai.allocationSize = k->size; ai.memoryTypeIndex = type;
         VkResult r = vkAllocateMemory(V.device, &ai, NULL, &k->mem);
+        if (r != VK_SUCCESS && g_vmem_soft) { free(k); return m; }      /* the caller tries another memory type (block -1) */
         if (r != VK_SUCCESS) vkd_fail("vkAllocateMemory of %llu MB (type %u): %s; %lld MB allocated so far", (unsigned long long)(k->size >> 20), type, vk_result_name(r), (long long)(g_mem_total >> 20));
         if (D.mp.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) VKC(vkMapMemory(V.device, k->mem, 0, VK_WHOLE_SIZE, 0, &k->map));
         k->nfree = 1; k->fr[0].off = 0; k->fr[0].size = k->size;
@@ -169,17 +171,18 @@ static void vmem_free(VMem m) {
     memmove(&k->fr[i + 1], &k->fr[i], sizeof k->fr[0] * (size_t)(k->nfree - i)); k->nfree++;
     k->fr[i].off = m.off; k->fr[i].size = m.size;
 }
-static VkBuffer vbuf_new(uint64_t size, VkFlags usage, VMem *mem) {
+static VkBuffer vbuf_new2(uint64_t size, VkFlags usage, VMem *mem, VkFlags want) {
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     VkBuffer b;
     VkMemoryRequirements rq;
     bi.size = size; bi.usage = usage; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VKC(vkCreateBuffer(V.device, &bi, NULL, &b));
     vkGetBufferMemoryRequirements(V.device, b, &rq);
-    *mem = vmem_alloc(rq, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 1);
+    *mem = vmem_alloc(rq, want, 1);
     VKC(vkBindBufferMemory(V.device, b, mem->mem, mem->off));
     return b;
 }
+static VkBuffer vbuf_new(uint64_t size, VkFlags usage, VMem *mem) { return vbuf_new2(size, usage, mem, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT); }
 
 /* ---------------------------------------------------------------- command buffers in flight */
 #define NSLOT 32                                   /* command buffers in flight (SSBU_VK_SPLIT submits several per batch) */
@@ -227,6 +230,11 @@ static LONG64 tk(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.
 static int g_ts_on = -1;
 static VkQueryPool g_ts_pool;
 static double g_ts_ns;
+/* session 12: the raw spans of the finished command buffers, merged at the 300-frame report (SSBU_VK_GPUTIME=1): the union
+ * is the time the GPU had work; what lies between the spans is time it waited for the CPU. */
+static struct { uint64_t t0, t1; } g_tsr[16384];
+static int g_tsr_n;
+static int tsr_cmp(const void *a, const void *b) { const uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
 static LONG64 g_ts_n;
 /* Session 9: the same per FRAME (the frame a buffer was recorded for), with the time between two presents and whether the frame
  * was a battle frame (compute dispatches and more than 120 draws): median / p99 of the battle frames at exit ("nvn_vk_gpu_fight:"). */
@@ -243,7 +251,7 @@ static void slot_wait(Slot *s) {
     VKC(vkResetFences(V.device, 1, &s->fence));
     if (g_ts_on > 0) {                             /* SSBU_VK_GPUTIME=1: the GPU's own clock at the first and the last command of this buffer */
         uint64_t ts[2] = {0, 0};
-        if (vkGetQueryPoolResults(V.device, g_ts_pool, (uint32_t)(s - R.slot) * 2, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] >= ts[0]) { double ns = (double)(ts[1] - ts[0]) * (double)V.props.limits.timestampPeriod; g_ts_ns += ns; g_ts_n++; if (s->ts_frame >= 0 && s->ts_frame < FRSTAT_N) g_fr_gpu[s->ts_frame] += (float)(ns / 1e6); }
+        if (vkGetQueryPoolResults(V.device, g_ts_pool, (uint32_t)(s - R.slot) * 2, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] >= ts[0]) { double ns = (double)(ts[1] - ts[0]) * (double)V.props.limits.timestampPeriod; g_ts_ns += ns; if (g_tsr_n < 16384) { g_tsr[g_tsr_n].t0 = ts[0]; g_tsr[g_tsr_n].t1 = ts[1]; g_tsr_n++; } g_ts_n++; if (s->ts_frame >= 0 && s->ts_frame < FRSTAT_N) g_fr_gpu[s->ts_frame] += (float)(ns / 1e6); }
     }
     s->pending = 0;
     if (s->serial > R.done) R.done = s->serial;
@@ -553,8 +561,11 @@ static VkFlags layout_access(VkImageLayout l) {
     default: return 0;
     }
 }
+static LONG64 g_bar_n, g_bar_hist[8][8], g_pass_n, g_cbar_n;      /* SSBU_VK_DPSTAT: layout changes (by old / new layout class), passes begun, compute barriers */
+static int lay_class(VkImageLayout l) { switch ((int)l) { case VK_IMAGE_LAYOUT_UNDEFINED: return 0; case VK_IMAGE_LAYOUT_GENERAL: return 1; case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: return 2; case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL: return 3; case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: return 4; case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: return 5; case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: return 6; default: return 7; } }
 static void image_barrier(VkImage img, VkFlags aspect, VkImageLayout from, VkImageLayout to) {
     VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    g_bar_n++; g_bar_hist[lay_class(from)][lay_class(to)]++;
     DBG_ASSERT(!R.in_pass, "debug: an image layout change inside a render pass");
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.image = img;
     b.subresourceRange.aspectMask = aspect; b.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS; b.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
@@ -1331,6 +1342,7 @@ static int pass_begin(void) {
     cmd_begin();                                   /* vt_get may have submitted (ring wrap) */
     ri.renderArea.extent.width = (uint32_t)w; ri.renderArea.extent.height = (uint32_t)h; ri.layerCount = 1; ri.colorAttachmentCount = (uint32_t)R.ncol; ri.pColorAttachments = ca;
     vkCmdBeginRendering(R.cmd, &ri);
+    g_pass_n++;
     R.in_pass = 1; R.pass_w = w; R.pass_h = h;
     return 1;
 }
@@ -1519,8 +1531,9 @@ static void set_dynamic_state3(int samples) {
  * when the render thread is idle or a sync is waited for. The OpenGL path copies back before the next draw; what guest
  * memory holds once the batch is done is the same. Anything that reads guest memory through a range that only partly lies
  * in a CB forces the copy-back at once (cb_sync: submit, wait; counted). */
-typedef struct { uint64_t addr, size, cap, busy; VkBuffer buf; VMem mem; int state, dirty; uint8_t *snap; uint64_t snap_cap; int mode; uint64_t ww_stamp; uint32_t head_n, tail_n; } CB;     /* state: 0 free, 1 live in this batch, 2 pending (batch submitted); snap: guest memory as it was when the CB was filled; mode: how it goes back (0 whole range, 1 merge with snap, 2 write watch) */
+typedef struct { uint64_t addr, size, cap, busy; VkBuffer buf; VMem mem; int state, dirty; uint8_t *snap; uint64_t snap_cap; int mode; uint64_t ww_stamp; uint32_t head_n, tail_n; VkBuffer sbuf; VMem smem; uint8_t *hmap; } CB;     /* state: 0 free, 1 live in this batch, 2 pending (batch submitted); snap: guest memory as it was when the CB was filled; mode: how it goes back (0 whole range, 1 merge with snap, 2 write watch) */
 static int g_cb_merge = -1;                        /* SSBU_VK_CBMERGE=0: the whole range is copied back as before session 5 */
+static int g_cb_dev = -1;                          /* session 12: CBs in video memory (see cb_new); SSBU_VK_CBDEV=0: in host memory as before */
 static int g_cb_ww = -1;                           /* SSBU_VK_CBWW=0: the snapshot even where the write watch could tell (session 12) */
 static CB g_cb[256];
 static int g_cb_live, g_cb_pending, g_cb_cached = -1;
@@ -1567,13 +1580,13 @@ static void cb_land(int midbatch) {                /* the GPU has finished every
              * word as in mode 1. A page wholly inside the range that the guest wrote meanwhile (not seen in the measured runs)
              * keeps the guest's bytes and is counted. */
             uint64_t newest = nvn_front_ww_newest(P(c->addr), (size_t)c->size);
-            if (newest && newest <= c->ww_stamp) acopy_big(P(c->addr), c->mem.map, (size_t)c->size);
+            if (newest && newest <= c->ww_stamp) acopy_big(P(c->addr), c->hmap, (size_t)c->size);
             else {
                 uint64_t a = c->addr, end = c->addr + c->size;
                 LONG64 gw = 0, cf = 0;
                 while (a < end) {
                     uint64_t pe = ((uint64_t)(uintptr_t)P(a) | 4095) + 1, n = (uint64_t)(uintptr_t)P(end) < pe ? end - a : pe - (uint64_t)(uintptr_t)P(a);
-                    uint8_t *g = P(a); const uint8_t *m = (const uint8_t *)c->mem.map + (a - c->addr);
+                    uint8_t *g = P(a); const uint8_t *m = (const uint8_t *)c->hmap + (a - c->addr);
                     if (nvn_front_ww_page((uint64_t)(uintptr_t)g >> 12) <= c->ww_stamp) memcpy(g, m, (size_t)n);
                     else if (a == c->addr && c->head_n) cb_merge(g, c->snap, m, c->head_n, &gw, &cf);
                     else if (a + n == end && c->tail_n) cb_merge(g, c->snap + 4096, m, c->tail_n, &gw, &cf);
@@ -1584,14 +1597,14 @@ static void cb_land(int midbatch) {                /* the GPU has finished every
             }
             R.cb_bytes += (LONG64)c->size;
         }
-        else if (c->dirty && c->mode == 0) { memcpy(P(c->addr), c->mem.map, (size_t)c->size); R.cb_bytes += (LONG64)c->size; }
+        else if (c->dirty && c->mode == 0) { memcpy(P(c->addr), c->hmap, (size_t)c->size); R.cb_bytes += (LONG64)c->size; }
         else if (c->dirty) {
             /* Session 5: the copy-back is DEFERRED (up to the next batch), so the guest may have written into the range since
              * the CB was filled. Only what compute changed goes back: a word the guest changed meanwhile (guest != snapshot)
              * is kept and counted; when compute changed that word too it is a real conflict (counted apart; the guest's later
              * write stays, as on the OpenGL path where the copy-back comes before it). */
             uint64_t *g = P(c->addr);
-            const uint64_t *s = (const uint64_t *)c->snap, *m = (const uint64_t *)c->mem.map;
+            const uint64_t *s = (const uint64_t *)c->snap, *m = (const uint64_t *)c->hmap;
             size_t nw = (size_t)(c->size / 8), tail = (size_t)(c->size & 7);
             LONG64 gw = 0, cf = 0;
             for (size_t k = 0; k < nw; k++) {
@@ -1619,10 +1632,23 @@ static void cb_poll(void) {                        /* pending CBs whose submissi
     if (R.done < g_cb_serial) for (int i = 0; i < NSLOT; i++) if (R.slot[i].pending && vkGetFenceStatus(V.device, R.slot[i].fence) == VK_SUCCESS) slot_wait(&R.slot[i]);
     if (R.done >= g_cb_serial) cb_land(0);
 }
+/* Session 12: with the CBs in video memory, what the dispatches wrote is copied into each CB's host buffer by the GPU,
+ * recorded right before the submission after which cb_land reads it. */
+static void cb_readback(void) {
+    if (g_cb_dev <= 0 || !g_cb_nlive) return;
+    pass_end();
+    cmd_begin();
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    for (int j = 0; j < g_cb_nlive; j++) { CB *c = &g_cb[g_cb_live_idx[j]]; VkBufferCopy cp = {0, 0, c->size}; if (c->sbuf) vkCmdCopyBuffer(R.cmd, c->buf, c->sbuf, 1, &cp); }
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+}
 static void cb_sync(void) {                        /* guest memory must hold what compute wrote, now */
     int mid = g_cb_live != 0;
     if (!g_cb_live && !g_cb_pending) return;
-    if (g_cb_live) { g_cb_serial = cmd_submit(NULL, NULL); R.cb_syncs++; }
+    if (g_cb_live) { cb_readback(); g_cb_serial = cmd_submit(NULL, NULL); R.cb_syncs++; }
     if (R.done < g_cb_serial) {
         LARGE_INTEGER t0, t1;
         QueryPerformanceCounter(&t0);
@@ -1635,6 +1661,7 @@ static void cb_sync(void) {                        /* guest memory must hold wha
 }
 static void cb_batch_end(void) {
     if (!g_cb_live) return;
+    cb_readback();
     g_cb_serial = cmd_submit(NULL, NULL);
     for (int j = 0; j < g_cb_nlive; j++) g_cb[g_cb_live_idx[j]].state = 2;
     g_cb_pending = g_cb_live; g_cb_live = 0; g_cb_nlive = 0;
@@ -1660,6 +1687,8 @@ static CB *cb_new(uint64_t addr, uint64_t size) {
         c = empty ? empty : victim;
         if (!c) vkd_fail("more than 256 storage buffers written by compute in one batch");
         if (c->buf) { vkDestroyBuffer(V.device, c->buf, NULL); vmem_free(c->mem); c->buf = NULL; }      /* free and not busy: nothing in flight names it */
+        if (c->sbuf) { vkDestroyBuffer(V.device, c->sbuf, NULL); vmem_free(c->smem); c->sbuf = NULL; }
+        if (g_cb_dev < 0) g_cb_dev = !(getenv("SSBU_VK_CBDEV") && !atoi(getenv("SSBU_VK_CBDEV")));
         if (g_cb_cached < 0) {                     /* read back by the CPU: cached host memory when the device has it */
             g_cb_cached = 0;
             for (uint32_t i = 0; i < D.mp.memoryTypeCount; i++) if ((D.mp.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) == (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) g_cb_cached = 1;
@@ -1667,15 +1696,27 @@ static CB *cb_new(uint64_t addr, uint64_t size) {
         VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         VkMemoryRequirements rq;
         c->cap = (size + 4095) & ~(uint64_t)4095;
-        bi.size = c->cap; bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        bi.size = c->cap; bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         VKC(vkCreateBuffer(V.device, &bi, NULL, &c->buf));
         vkGetBufferMemoryRequirements(V.device, c->buf, &rq);
         VkFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | (g_cb_cached ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0);
         int found = 0;
         for (uint32_t i = 0; i < D.mp.memoryTypeCount; i++) if ((rq.memoryTypeBits >> i & 1) && (D.mp.memoryTypes[i].propertyFlags & want) == want) found = 1;
         if (!found) want &= ~(VkFlags)VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
-        c->mem = vmem_alloc(rq, want, 2);
-        VKC(vkBindBufferMemory(V.device, c->buf, c->mem.mem, c->mem.off));
+        if (g_cb_dev > 0) {                        /* video memory for the GPU, a host buffer of the same size for the copy-back */
+            c->mem = vmem_alloc(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+            VKC(vkBindBufferMemory(V.device, c->buf, c->mem.mem, c->mem.off));
+            VkBufferCreateInfo si = bi; si.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            VKC(vkCreateBuffer(V.device, &si, NULL, &c->sbuf));
+            vkGetBufferMemoryRequirements(V.device, c->sbuf, &rq);
+            c->smem = vmem_alloc(rq, want, 2);
+            VKC(vkBindBufferMemory(V.device, c->sbuf, c->smem.mem, c->smem.off));
+            c->hmap = c->smem.map;
+        } else {
+            c->mem = vmem_alloc(rq, want, 2);
+            VKC(vkBindBufferMemory(V.device, c->buf, c->mem.mem, c->mem.off));
+            c->hmap = c->mem.map;
+        }
         R.cb_made++;
     }
     c->addr = addr; c->size = size; c->state = 1; c->dirty = 0;
@@ -1700,14 +1741,27 @@ static CB *cb_new(uint64_t addr, uint64_t size) {
         if (c->snap_cap < 8192) { free(c->snap); c->snap_cap = 8192; c->snap = malloc(8192); }
         if (c->head_n) memcpy(c->snap, P(addr), c->head_n);
         if (c->tail_n) memcpy(c->snap + 4096, P(addr + size - c->tail_n), c->tail_n);
-        acopy_big(c->mem.map, P(addr), (size_t)size);
+        if (!c->sbuf) acopy_big(c->hmap, P(addr), (size_t)size);
     } else if (g_cb_merge) {                       /* the snapshot the copy-back is compared with (cb_land) */
         c->mode = 1;
         if (c->snap_cap < size) { free(c->snap); c->snap_cap = (size + 4095) & ~(uint64_t)4095; c->snap = malloc((size_t)c->snap_cap); }
         memcpy(c->snap, P(addr), (size_t)size);
-        memcpy(c->mem.map, c->snap, (size_t)size);
-    } else
-    memcpy(c->mem.map, P(addr), (size_t)size);
+        if (!c->sbuf) memcpy(c->hmap, c->snap, (size_t)size);
+    } else if (!c->sbuf)
+    memcpy(c->hmap, P(addr), (size_t)size);
+    if (c->sbuf) {
+        /* Session 12: the CB lives in video memory (in host memory every dispatch read and wrote it across the bus, and the
+         * draws read the skinned vertices from there: the compute dispatches took ~3 ms of GPU time per frame in the heavy
+         * fight). Filled from the stream ring by the GPU; the copy-back goes through the host buffer (cb_readback). */
+        uint64_t off = ring_put(addr, size);           /* may submit (a ring wrap): recorded after it */
+        pass_end();
+        cmd_begin();
+        VkBufferCopy cp = {off, 0, size};
+        vkCmdCopyBuffer(R.cmd, R.ring, c->buf, 1, &cp);
+        VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    }
     g_cb_live++;
     return c;
 }
@@ -1860,7 +1914,7 @@ static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uin
     if (v->ssbo_w) {                               /* what the dispatch wrote is read by later dispatches and draws of this command buffer */
         VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
-        vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL); g_cbar_n++;
         CDisp *d = &g_cdisp[g_ncdisp++];
         d->wm_off = wm_off; d->written = v->ssbo_w; memcpy(d->cb, wcb, sizeof wcb);
     }
@@ -2961,7 +3015,16 @@ handed:
         static LONG64 last[12], last_sets, last_flush, last_reused, last_disp;
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         double k = 1000.0 / (double)fq.QuadPart / 300.0;
-        if (g_ts_on > 0) { static double ts_last; static LONG64 n_last; printf("nvn_vk_gpu: frames %lld..%lld: GPU time %.2f ms per frame (first to last command of %lld command buffers finished in the window)\n", (long long)frame - 300, (long long)frame, (g_ts_ns - ts_last) / 1e6 / 300.0, (long long)(g_ts_n - n_last)); ts_last = g_ts_ns; n_last = g_ts_n; }
+        if (g_ts_on > 0) { static double ts_last; static LONG64 n_last; printf("nvn_vk_gpu: frames %lld..%lld: GPU time %.2f ms per frame (first to last command of %lld command buffers finished in the window)\n", (long long)frame - 300, (long long)frame, (g_ts_ns - ts_last) / 1e6 / 300.0, (long long)(g_ts_n - n_last)); ts_last = g_ts_ns; n_last = g_ts_n;
+            if (g_tsr_n > 1) {
+                qsort(g_tsr, (size_t)g_tsr_n, sizeof g_tsr[0], tsr_cmp);
+                uint64_t busy = 0, cs = g_tsr[0].t0, ce = g_tsr[0].t1;
+                for (int i = 1; i < g_tsr_n; i++) { if (g_tsr[i].t0 > ce) { busy += ce - cs; cs = g_tsr[i].t0; ce = g_tsr[i].t1; } else if (g_tsr[i].t1 > ce) ce = g_tsr[i].t1; }
+                busy += ce - cs;
+                double per = (double)V.props.limits.timestampPeriod / 1e6 / 300.0;
+                printf("nvn_vk_gpu: frames %lld..%lld: GPU busy %.2f ms per frame (union of the spans), idle between them %.2f ms per frame\n", (long long)frame - 300, (long long)frame, (double)busy * per, (double)(ce - g_tsr[0].t0 - busy) * per);
+            }
+            g_tsr_n = 0; }
         printf("nvn_vk_perf: frames %lld..%lld ms/frame: batch replay %.2f (of it: dispatch %.2f, draw preparation %.2f, pipelines %.2f, shader modules %.2f), wait for the GPU %.2f, copy-back %.2f (waiting at batch start %.2f), present %.2f | per frame: %.1f dispatches, %.0f descriptor sets allocated, %.0f reused, %.1f submissions | pipelines not made ahead so far: %lld | holds so far: %lld, %.1f ms, longest %.1f ms\n",
                (long long)frame - 300, (long long)frame, (double)(g_tm[3] - last[3]) * k, (double)(g_tm[2] - last[2]) * k, (double)(g_tm[8] - last[8]) * k, (double)(g_tm[5] - last[5]) * k, (double)(g_tm[6] - last[6]) * k,
                (double)(g_tm[0] - last[0]) * k, (double)(g_tm[1] - last[1]) * k, (double)(g_tm[7] - last[7]) * k, (double)(g_tm[4] - last[4]) * k, (double)(R.dispatches - last_disp) / 300.0, (double)(R.sets - last_sets) / 300.0, (double)(R.sets_reused - last_reused) / 300.0, (double)(R.flushes - last_flush) / 300.0, (long long)g_pipe_miss,
@@ -2979,7 +3042,16 @@ handed:
         if (g_dpstat > 0) { static LONG64 dl[8];
             printf("nvn_vk_dprep: frames %lld..%lld ms/frame: stages %.2f, textures %.2f, buffers %.2f, pass + pipeline + state %.2f, vertex input %.2f, descriptors %.2f, push constants %.2f | texture set cache emptied %lld times so far (images destroyed %lld, cache full %lld, pools full %lld), %lld group waits\n", (long long)frame - 300, (long long)frame,
                    (g_dp[0] - dl[0]) * k, (g_dp[1] - dl[1]) * k, (g_dp[2] - dl[2]) * k, (g_dp[3] - dl[3]) * k, (g_dp[4] - dl[4]) * k, (g_dp[5] - dl[5]) * k, (g_dp[6] - dl[6]) * k, (long long)g_tset_forgets, (long long)g_ts_flush_n[0], (long long)g_ts_flush_n[1], (long long)g_ts_flush_n[2], (long long)g_tsg_waits);
-            memcpy(dl, g_dp, sizeof dl); }
+            memcpy(dl, g_dp, sizeof dl);
+            {   static LONG64 bl, pl, cl, hl[8][8];
+                static const char *nm[8] = {"undef", "general", "color", "depth", "read", "tsrc", "tdst", "other"};
+                char line[1024]; int o = 0;
+                for (int a = 0; a < 8; a++) for (int b = 0; b < 8; b++) { LONG64 d = g_bar_hist[a][b] - hl[a][b]; if (d >= 300 && o < 900) o += snprintf(line + o, sizeof line - (size_t)o, " %s>%s %.1f", nm[a], nm[b], d / 300.0); }
+                line[o] = 0;
+                printf("nvn_vk_bar: frames %lld..%lld per frame: %.1f layout changes (each a full barrier, the pass ended), %.1f passes begun, %.1f compute barriers |%s\n", (long long)frame - 300, (long long)frame,
+                       (g_bar_n - bl) / 300.0, (g_pass_n - pl) / 300.0, (g_cbar_n - cl) / 300.0, line);
+                bl = g_bar_n; pl = g_pass_n; cl = g_cbar_n; memcpy(hl, g_bar_hist, sizeof hl);
+            } }
         if (frame % 3000 == 0) m4_report();
         memcpy(last, g_tm, sizeof last); last_sets = R.sets; last_flush = R.flushes; last_reused = R.sets_reused; last_disp = R.dispatches;
     }
@@ -3152,7 +3224,34 @@ static void vkd_init(void) {
         VKC(vkCreateFence(V.device, &fi, NULL, &R.slot[i].fence));
     }
     R.ring_size = 256ull << 20;
-    R.ring = vbuf_new(R.ring_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &R.ring_mem);
+    {   /* Session 12: the stream ring in video memory the CPU can write (device-local + host-visible: the BAR window, 214 MB
+         * on this RTX 3080 without resizable BAR), when the GPU has one of at least 192 MB: 128 MB there (256 MB when the
+         * window is 1 GB or more). In host memory every vertex, index and uniform read of every draw and dispatch crossed
+         * the bus (heavy fight: GPU busy 3.1 -> 2.6 ms per frame together with the CBs in video memory). The CPU only
+         * writes the ring (write-combined, as before) and reads the dispatches' 4-byte mask words. SSBU_VK_RINGBAR=0: host. */
+        VkFlags usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        VkFlags bar = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        uint64_t heap = 0;
+        for (uint32_t i = 0; i < D.mp.memoryTypeCount; i++) if ((D.mp.memoryTypes[i].propertyFlags & bar) == bar && D.mp.memoryHeaps[D.mp.memoryTypes[i].heapIndex].size > heap) heap = D.mp.memoryHeaps[D.mp.memoryTypes[i].heapIndex].size;
+        int on = !(getenv("SSBU_VK_RINGBAR") && !atoi(getenv("SSBU_VK_RINGBAR"))) && heap >= (192ull << 20);
+        R.ring = NULL;
+        if (on) {
+            R.ring_size = heap >= (1ull << 30) ? 256ull << 20 : 128ull << 20;
+            g_vmem_soft = 1;
+            VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            VkMemoryRequirements rq;
+            bi.size = R.ring_size; bi.usage = usage; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            VKC(vkCreateBuffer(V.device, &bi, NULL, &R.ring));
+            vkGetBufferMemoryRequirements(V.device, R.ring, &rq);
+            R.ring_mem = vmem_alloc(rq, bar, 1);
+            g_vmem_soft = 0;
+            if (R.ring_mem.block >= 0) VKC(vkBindBufferMemory(V.device, R.ring, R.ring_mem.mem, R.ring_mem.off));
+            else { vkDestroyBuffer(V.device, R.ring, NULL); R.ring = NULL; }
+        }
+        int inbar = R.ring != NULL;
+        if (!R.ring) { R.ring_size = 256ull << 20; R.ring = vbuf_new(R.ring_size, usage, &R.ring_mem); }
+        printf("nvn_vk: stream ring %llu MB in %s (device-local + host-visible memory: %llu MB)\n", (unsigned long long)(R.ring_size >> 20), inbar ? "video memory (the BAR window)" : "host memory", (unsigned long long)(heap >> 20));
+    }
     R.zero = vbuf_new(65536 + 64, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &R.zero_mem);
     memset(R.zero_mem.map, 0, 65536 + 64);
     { float f1 = 1.0f; uint32_t i1 = 1; memcpy((uint8_t *)R.zero_mem.map + 65536 + 12, &f1, 4); memcpy((uint8_t *)R.zero_mem.map + 65536 + 28, &i1, 4); }
@@ -3228,7 +3327,7 @@ static void vkd_shutdown(void) {
     for (int i = 0; i < 8; i++) for (int k = 0; k < 2; k++) if (g_sem[i][k]) { vkDestroySemaphore(V.device, g_sem[i][k], NULL); g_sem[i][k] = NULL; }
     for (int i = 0; i < 16; i++) if (g_sem_img[i]) { vkDestroySemaphore(V.device, g_sem_img[i], NULL); g_sem_img[i] = NULL; }
     if (g_ovl.made) { vkDestroyImage(V.device, g_ovl.img, NULL); g_ovl.made = 0; }      /* the progress bar's image; its memory goes with the blocks */
-    for (int i = 0; i < 256; i++) if (g_cb[i].buf) { vkDestroyBuffer(V.device, g_cb[i].buf, NULL); g_cb[i].buf = NULL; g_cb[i].state = 0; }
+    for (int i = 0; i < 256; i++) { if (g_cb[i].buf) { vkDestroyBuffer(V.device, g_cb[i].buf, NULL); g_cb[i].buf = NULL; g_cb[i].state = 0; } if (g_cb[i].sbuf) { vkDestroyBuffer(V.device, g_cb[i].sbuf, NULL); g_cb[i].sbuf = NULL; } }
     g_cb_live = g_cb_pending = g_ncdisp = 0;
     for (int i = 0; i < 4096; i++) for (VStage *v = g_vstage[i], *n; v; v = n) {
         n = v->next;
