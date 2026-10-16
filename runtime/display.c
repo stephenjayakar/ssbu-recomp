@@ -72,6 +72,11 @@ int oe_exit_request(void);                            /* nnmisc.c */
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_CLOSE) {                             /* the exit request: nn::oe decides (nnmisc.c oe_exit_request) whether the game ends now or after its exit-request handling section */
         printf("\nwindow closed by the user after %lld frames\n", (long long)g_frames);
+        /* session 12: the window goes at once. The exit path below runs on this thread and writes the pipeline cache
+         * (300-800 MB, 12 s measured on this PC): a window that stays up meanwhile stops answering, Windows offers to end
+         * the program, and an ended program saves nothing (a play session of 2026-10-15: its log stops during the exit
+         * path, before "pipeline cache saved", so the next start compiles that session's new pipelines again). */
+        ShowWindow(h, SW_HIDE);
         if (!oe_exit_request()) report_and_exit(0);
         return 0;
     }
