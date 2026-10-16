@@ -5189,9 +5189,13 @@ void nvn_front_count(int what, long long n) {
 int nvn_front_clip_modes(void) { return g_origin_mode | g_depth_mode << 8; }
 const char *nvn_front_op_name(unsigned op) { return k_op_name[op < OP_COUNT ? op : 0]; }
 void *nvn_front_hwnd(void) { return g_hwnd; }
-static void job_vk_shutdown(void *arg) { (void)arg; nvn_vk_shutdown(); }
-/* At exit (nvn_gl_report): the render thread destroys the Vulkan objects. It is given 3 s: a render thread that is held
- * in a job at that moment is left alone (the process is ending) and that is said. */
+static volatile LONG g_vk_shutdown_taken;
+static void job_vk_shutdown(void *arg) { (void)arg; InterlockedExchange(&g_vk_shutdown_taken, 1); nvn_vk_shutdown(); }
+/* At exit (nvn_gl_report): the render thread destroys the Vulkan objects. It is given 3 s to take the job: a render thread
+ * that is held in a job at that moment is left alone (the process is ending) and that is said. Once it has taken the job
+ * it is given up to 120 s to finish: the shutdown writes the driver's pipeline cache (300+ MB, several seconds), and a
+ * process ended in the middle of that left a partial .tmp and the old cache, so every start made its pipelines again
+ * (16-66 s of "the first batch waited" at boot, and loading screens held for seconds). */
 static void vk_shutdown_at_exit(void) {
     static Job j;
     if (GetCurrentThreadId() == g_render_tid) { nvn_vk_shutdown(); return; }
@@ -5201,7 +5205,12 @@ static void vk_shutdown_at_exit(void) {
     g_job_tail = &j;
     LeaveCriticalSection(&g_job_lock);
     SetEvent(g_job_event);
-    if (WaitForSingleObject(j.done, 3000) != WAIT_OBJECT_0) { printf("nvn_vk: shutdown NOT run: the render thread did not take the job within 3 s\n"); fflush(stdout); }
+    ULONGLONG t0 = GetTickCount64();
+    DWORD r = WaitForSingleObject(j.done, 3000);
+    if (r != WAIT_OBJECT_0 && g_vk_shutdown_taken) r = WaitForSingleObject(j.done, 120000);
+    if (r != WAIT_OBJECT_0) printf("nvn_vk: shutdown NOT run to its end: the render thread %s\n", g_vk_shutdown_taken ? "took the job but did not finish it within 120 s" : "did not take the job within 3 s");
+    else printf("nvn_vk: shutdown (pipeline cache included) done in %.1f s on the render thread\n", (double)(GetTickCount64() - t0) / 1000.0);
+    fflush(stdout);
 }
 
 /* nvnBufferFlushMappedRange / nvnMemoryPoolFlushMappedRange (nvn_stub.c): the CPU wrote this memory. Textures stored there are read again. */

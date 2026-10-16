@@ -373,6 +373,7 @@ static volatile LONG g_in_fight;
 static struct { PKey k; VkPipeline lib; } g_olib[128];
 static int g_nolib;
 static VkPipeline g_vilib[3];
+static LONG64 g_slib_hit, g_slib_hit_tk, g_slib_miss, g_slib_miss_tk, g_slib_nofb;      /* stage libraries: driver pipeline-cache hits / misses (creation feedback) */
 static LONG64 g_gpl_made, g_gpl_made_tk, g_gpl_draw, g_gpl_draw_tk, g_gpl_draw_max, g_gpl_wait, g_gpl_wait_tk, g_gpl_link, g_gpl_link_tk, g_gpl_link_max, g_gpl_dlink, g_gpl_dlink_tk, g_gpl_dlink_max, g_gpl_dlink_fight;
 static DWORD g_render_tid;
 static uint32_t pipe_dyn_list(VkDynamicState *dyn) {
@@ -590,9 +591,17 @@ static VkPipeline stagelib_ensure(VStage *v, int alone, int *how) {
     gi.pNext = &gl; gi.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | (gpl_opt_on() ? VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT : 0); gi.stageCount = 1; gi.pStages = &st; gi.pDynamicState = &dy; gi.layout = g_ulayout;
     if (!isfs) { gi.pViewportState = &vp; gi.pRasterizationState = &rs; }
     if (isfs || alone) gi.pDepthStencilState = &ds;
+    VkPipelineCreationFeedback fbw = {0}, fbs = {0};
+    VkPipelineCreationFeedbackCreateInfo fb = {VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO};
+    fb.pPipelineCreationFeedback = &fbw; fb.pipelineStageCreationFeedbackCount = 1; fb.pPipelineStageCreationFeedbacks = &fbs;
+    fb.pNext = gi.pNext; gi.pNext = &fb;
+    LONG64 tc = tk();
     VkResult r = vkCreateGraphicsPipelines(V.device, g_pcache, 1, &gi, NULL, lib);
     if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines, stage library (%s stage %u): %s", isfs ? "fragment" : "vertex", v->id, vk_result_name(r));
     LONG64 dt = tk() - t0;
+    if (!(fbw.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT)) InterlockedIncrement64(&g_slib_nofb);
+    else if (fbw.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) { InterlockedIncrement64(&g_slib_hit); InterlockedAdd64(&g_slib_hit_tk, tk() - tc); }
+    else { InterlockedIncrement64(&g_slib_miss); InterlockedAdd64(&g_slib_miss_tk, tk() - tc); }
     EnterCriticalSection(&g_sh_lock);
     *state = 2;
     WakeAllConditionVariable(&g_sh_cv);
@@ -1676,6 +1685,8 @@ static void m4_report(void) {
                (long long)g_gpl_made, (double)g_gpl_made_tk * q, (long long)g_gpl_cross, g_nfo, g_nshvs, (long long)g_gpl_draw, (double)g_gpl_draw_tk * q, (double)g_gpl_draw_max * q, (long long)g_gpl_wait, (double)g_gpl_wait_tk * q,
                (long long)g_gpl_dlink, (long long)g_gpl_dlink_fight, (double)g_gpl_dlink_tk * q, (double)g_gpl_dlink_max * q, (long long)g_gpl_link, (double)g_gpl_link_tk * q, g_nolib);
     }
+    if (D.has_gpl) printf("nvn_vk_gpl: stage libraries made: %lld hits of the driver's pipeline cache (%.0f ms in all), %lld misses = compiled (%.0f ms in all), %lld without feedback\n",
+                          (long long)g_slib_hit, (double)g_slib_hit_tk * 1000.0 / (double)fq.QuadPart, (long long)g_slib_miss, (double)g_slib_miss_tk * 1000.0 / (double)fq.QuadPart, (long long)g_slib_nofb);
     if (D.has_gpl) printf("nvn_vk_gpl: mode %s; pipelines linked again with optimisation by the workers: %lld of %lld queued, %.0f ms of worker time\n", gpl_sep() ? "2 (a library per stage)" : "1 (a library per stage pair)", (long long)g_gpl_opt_n, (long long)g_gpl_opt_q, (double)g_gpl_opt_tk * 1000.0 / (double)fq.QuadPart);
     printf("nvn_vk_skip: shader_wait = %s; draws left out because a stage or pipeline was not ready: %lld in %lld frames (stage not ready %lld, pipeline not ready %lld)\n", skip_on() ? "skip (near a fight)" : "hold (the default)", (long long)g_skip_n, (long long)g_skip_frames, (long long)g_skip_stage, (long long)g_skip_pipe);
     if (g_pix_ready) printf("nvn_vk_prep: containers announced whole from the index: %lld because a pool was laid over their code, %lld because one of their programs was handed over (%lld of all these while IN A FIGHT), %lld variations queued; pools looked up: %lld found in the index, %lld not; programs handed over whose variation several files hold (no container named): %lld; header searches not made near a fight: %lld\n",
@@ -1806,6 +1817,15 @@ static void pcache_save_at(int where, int marker) {
         g_pcprobe_stop = 1; WaitForSingleObject(probe, 30000); CloseHandle(probe); CloseHandle(ready);
         printf("nvn_vk: TEST probe: a stage library made again from the same cache by another thread (normal priority): longest call %.1f ms in the 20 calls BEFORE the read-out, %.1f ms in the %lld calls DURING it (read-out %.0f ms)\n",
                (double)g_pcprobe_before * 1000.0 / (double)fq.QuadPart, (double)g_pcprobe_max * 1000.0 / (double)fq.QuadPart, (long long)g_pcprobe_n, (double)(tk() - t0) * 1000.0 / (double)fq.QuadPart);
+    }
+    if (!marker) {                                /* nothing made since the file was read or written (the same size): no rewrite of 300+ MB on the exit path */
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (GetFileAttributesExA(g_pcache_path, GetFileExInfoStandard, &fa) && (((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow) == (uint64_t)n) {
+            printf("nvn_vk: pipeline cache unchanged (%llu KB, the size of the file): not written again\n", (unsigned long long)(n >> 10));
+            fflush(stdout);
+            free(data);
+            return;
+        }
     }
     PcWrite *w = calloc(1, sizeof *w);
     w->data = data; w->n = n; w->marker = marker; w->where = where; w->one_call = one; w->prio = GetThreadPriority(GetCurrentThread()); w->t_get = tk() - t0;
@@ -2257,6 +2277,10 @@ static DWORD WINAPI prep_main(void *arg) {
     char path[400];
     LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
     (void)arg;
+    /* P3: not before the pipelines of earlier runs are made (the first batch waits for them). Started together, this thread's
+     * reads of the container store (300 MB, on the same disk as the stage records) and its queue doubled to tripled that wait:
+     * first batch waited 24-50 s with the preparation on, 1.5 s without (warm pipeline cache, runs "fightstart" / "w14b"). */
+    if (g_pw_gate) WaitForSingleObject(g_pw_gate, 120000);
     /* Session 12: the store belongs to ONE data.arc. `store_source.txt` in the store's folder holds the archive's size and
      * modification time; an archive that differs (a game update, another dump) makes the store stale: its *.bnsh files and
      * the preparation's marker are removed and the store is built again. A store without the file (made before session 12)
