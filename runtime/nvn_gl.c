@@ -50,6 +50,7 @@
 #include "tex_decode.h"
 #include "nvn_sdk.h"
 #include "nvn_c4.h"
+#define printf log_printf                                  /* hostrt.h: the reports of a present can be written with one call */
 
 #pragma comment(lib, "opengl32.lib")
 

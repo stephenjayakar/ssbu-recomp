@@ -66,7 +66,7 @@ uint64_t cxxrt_main_symbol(const char *name) {           /* address of a functio
 static struct { uint64_t base, size; } g_guest_region[64];
 static volatile LONG g_guest_regions, g_mem_epoch = 1;
 static int g_rd_nocache = -1;
-static volatile LONG64 g_rd_asked, g_rd_cached;
+static volatile LONG64 g_rd_asked, g_rd_cached, g_rd_probed;
 void cxxrt_guest_region(uint64_t base, uint64_t size) {
     LONG i = InterlockedIncrement(&g_guest_regions) - 1;
     if (i < 64) { g_guest_region[i].size = size; g_guest_region[i].base = base; } else InterlockedDecrement(&g_guest_regions);
@@ -74,7 +74,7 @@ void cxxrt_guest_region(uint64_t base, uint64_t size) {
 void cxxrt_mem_changed(void) { InterlockedIncrement(&g_mem_epoch); }
 LONG cxxrt_mem_epoch(void) { return g_mem_epoch; }      /* nvn_vk_m4.c: its record of readable runs is valid while this stays the same */
 int cxxrt_is_guest(uint64_t p) { for (int i = 0; i < g_guest_regions && i < 64; i++) if (p - g_guest_region[i].base < g_guest_region[i].size) return 1; return 0; }
-void cxxrt_readable_report(FILE *out) { fprintf(out, "nncxxrt: readable checks: %lld answered by VirtualQuery, %lld from the per-thread record of game-managed memory\n", (long long)g_rd_asked, (long long)g_rd_cached); }
+void cxxrt_readable_report(FILE *out) { fprintf(out, "nncxxrt: readable checks: %lld answered by VirtualQuery, %lld from the per-thread record of game-managed memory, %lld by a guarded read of it\n", (long long)g_rd_asked, (long long)g_rd_cached, (long long)g_rd_probed); }
 int cxxrt_readable(uint64_t p, size_t n) {
     static __declspec(thread) struct { uint64_t lo, hi; LONG epoch; } t_ok[4];
     static __declspec(thread) unsigned t_next;
@@ -86,6 +86,19 @@ int cxxrt_readable(uint64_t p, size_t n) {
     if (!g_rd_nocache) {
         for (int i = 0; i < g_guest_regions && i < 64 && !guest; i++) guest = p - g_guest_region[i].base < g_guest_region[i].size;
         if (guest) for (int i = 0; i < 4; i++) if (t_ok[i].epoch == epoch && p >= t_ok[i].lo && p + n <= t_ok[i].hi) { g_rd_cached++; return 1; }
+        /* P3 (hitch log, bench "diag fl23mods prof": 11 fight frames of 15-19 ms, each with 9-12 ms inside __cxa_throw of
+         * L2CExceptionShutdown): the record above is forgotten at every decommit / protect of guest memory, which the game
+         * does all the time in a fight, so most throws paid VirtualQuery walks again. Game-managed memory has no guard
+         * pages (only commit / decommit and read-write / read-only / no-access): one read per page under SEH answers the
+         * same question (committed and readable) in nanoseconds. */
+        if (guest) {
+            int ok = 1;
+            __try {
+                for (uint64_t a = p & ~0xfffull; a < p + (n ? n : 1); a += 0x1000) (void)*(volatile const uint8_t *)(uintptr_t)(a < p ? p : a);
+            } __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
+            g_rd_probed++;
+            return ok;
+        }
     }
     g_rd_asked++;
     if (!VirtualQuery((void *)(uintptr_t)p, &mi, sizeof mi)) return 0;

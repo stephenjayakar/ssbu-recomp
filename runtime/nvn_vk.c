@@ -29,6 +29,8 @@
 #include <vulkan/vulkan.h>
 #include "nvn_front.h"
 #include "gfx_options.h"
+int log_printf(const char *fmt, ...); void log_cap_begin(void); void log_cap_end(void);      /* hostrt.c */
+#define printf log_printf                                  /* P3: a periodic report of the render thread can be written with one call */
 #define P(a) ((void *)(uintptr_t)(a))                     /* guest addresses are host addresses (as in nvn_gl.c) */
 static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties *dext, uint32_t ndext);     /* nvn_vk_draw.c (included at the end) */
 static void vkd_init(void);

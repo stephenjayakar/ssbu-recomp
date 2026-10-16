@@ -433,6 +433,48 @@ void module_coverage_report(FILE *out);      /* nnro.c: script module functions 
 
 void (*g_exit_report_hook)(FILE *);          /* a test's own last line (nnsdk2.c eh_main_test) */
 
+/* hostrt.h log_cap_begin: measured on the render thread (run "diag tailtime"): the reports after a present took 3.4 ms every
+ * 300 frames, 5.5 ms every 600 and 11 ms every 3000 (25-60 printf calls each, one WriteFile apiece): a long frame every 2.5 s
+ * of the 120 Hz mode. */
+static __declspec(thread) char *t_cap;
+static __declspec(thread) size_t t_cap_n, t_cap_sz;
+static __declspec(thread) int t_cap_on;
+void log_cap_begin(void) { t_cap_on++; }
+void log_cap_end(void) {
+    if (t_cap_on > 0 && --t_cap_on == 0 && t_cap_n) { fwrite(t_cap, 1, t_cap_n, stdout); t_cap_n = 0; }
+}
+int log_printf(const char *fmt, ...) {
+    va_list ap;
+    int r;
+    va_start(ap, fmt);
+    if (t_cap_on > 0) {
+        for (int tries = 0; tries < 2; tries++) {
+            if (t_cap_sz - t_cap_n < 1024) {
+                size_t ns = t_cap_sz ? t_cap_sz * 2 : 65536;
+                char *nb = realloc(t_cap, ns);
+                if (!nb) break;
+                t_cap = nb; t_cap_sz = ns;
+            }
+            va_list aq;
+            va_copy(aq, ap);
+            r = vsnprintf(t_cap + t_cap_n, t_cap_sz - t_cap_n, fmt, aq);
+            va_end(aq);
+            if (r < 0) break;
+            if ((size_t)r < t_cap_sz - t_cap_n) { t_cap_n += (size_t)r; va_end(ap); return r; }
+            {   size_t ns = t_cap_sz;                      /* too long for what is left: grow to fit, then once more */
+                while (ns - t_cap_n <= (size_t)r) ns *= 2;
+                char *nb = realloc(t_cap, ns);
+                if (!nb) break;
+                t_cap = nb; t_cap_sz = ns;
+            }
+        }
+        if (t_cap_n) { fwrite(t_cap, 1, t_cap_n, stdout); t_cap_n = 0; }      /* out of memory or a format error: print directly */
+    }
+    r = vprintf(fmt, ap);
+    va_end(ap);
+    return r;
+}
+
 void report_and_exit(int code) {
     if (g_exit_report_hook) g_exit_report_hook(stdout);
     audit_exit_counts();

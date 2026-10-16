@@ -2776,6 +2776,7 @@ handed:
     g_wd_where = 0;
     if (progress) { g_ovl_presents++; return; }
     g_tm[4] += tk() - t_present;
+    log_cap_begin();                             /* P3: the reports below and in nvn_front_frame_end are written with one call (hostrt.h) */
     nvn_front_frame_end(R.frame_draws, R.frame_skipped, R.frame_clears);
     { static LONG64 disp_prev; g_in_fight = R.dispatches != disp_prev; disp_prev = R.dispatches; if (g_in_fight) { g_fight_last = frame; if (g_prep_state == 1) g_prep_fight_frames++; } }      /* a frame with compute dispatches (skinning): fighters are on screen */
     {   /* session 9: per-frame record for the "nvn_vk_gpu_fight:" line */
@@ -2838,6 +2839,7 @@ handed:
     }
     if (frame % 600 == 0) { printf("nvn_vk: images made per NVN texture format (format:count):"); for (int i = 0; i < 256; i++) if (g_fmt_hist[i]) printf(" 0x%x:%u", i, g_fmt_hist[i]); printf("\n"); }
     R.frame_draws = R.frame_skipped = R.frame_clears = 0;
+    log_cap_end();
 }
 const RBackend rb_vk = {"vk", vk_submit, vk_submit_async, vk_present, vk_present_movie, vk_fence, vk_sync_wait, vk_server_wait, vk_sync_drop, vk_flush, vk_finish, vk_write_texels, vk_read_texels, vk_housekeeping,
                         vk_reset_status, vk_no_grid, vk_idle};
