@@ -397,8 +397,12 @@ static int attach_dll(NroModule *m) {
     DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
     while (n && path[n - 1] != '\\' && path[n - 1] != '/') n--;
     const char *bin = getenv("SSBU_NRO_BIN");               /* folder of the module DLLs next to the exe (default nro_bin) */
-    snprintf(path + n, sizeof path - n, "%s\\%s.dll", bin && bin[0] ? bin : "nro_bin_eh_o2", m->info->name);      /* P3 (2026-10-09): the optimised modules are the default; SSBU_NRO_BIN=nro_bin_eh = the -O0 ones */
+    /* P3: without SSBU_NRO_BIN the modules built with the flags in locals and clang 23 (nro_bin_fl23: flags_local.py
+     * gen_nro_eh_o2 gen_nro_fl23, then build_opt.py nro with RECOMP_NRO_SUFFIX=_fl23) are taken when there, else the
+     * optimised ones of 2026-10-09 (nro_bin_eh_o2); SSBU_NRO_BIN=nro_bin_eh = the -O0 ones */
+    snprintf(path + n, sizeof path - n, "%s\\%s.dll", bin && bin[0] ? bin : "nro_bin_fl23", m->info->name);
     HMODULE dll = LoadLibraryA(path);
+    if (!dll && !(bin && bin[0])) { snprintf(path + n, sizeof path - n, "nro_bin_eh_o2\\%s.dll", m->info->name); dll = LoadLibraryA(path); }
     const char *python = getenv("SSBU_NRO_AUTOBUILD");       /* development aid: path of python.exe; lift a missing module on demand */
     if (!dll && python && python[0]) {
         char cmd[MAX_PATH * 4];

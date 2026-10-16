@@ -10,6 +10,11 @@ so dependency checks, linking and names stay theirs. Folders and names come from
 (defaults here: RECOMP_GEN=gen_eh_o2 RECOMP_OBJ=obj_eh_o2 RECOMP_DLL=ssbu_game_eh_o2.dll RECOMP_NRO_SUFFIX=_eh_o2).
 Run the result with:  RECOMP_GEN=gen_eh_o2 RECOMP_OBJ=obj_eh_o2 RECOMP_DLL=ssbu_game_eh_o2.dll RECOMP_EXE=<exe> python build.py link
                       SSBU_NRO_BIN=nro_bin_eh_o2 <exe> ...
+The script modules with the flags in locals (what the exe takes by default when the folder is there, nnro.c):
+    python flags_local.py gen_nro_eh_o2 gen_nro_fl23
+    RECOMP_NRO_SUFFIX=_fl23 RECOMP_CLANG=<clang 23> RECOMP_OPT=-O2 RECOMP_CFLAGS=-march=znver2 python build_opt.py nro 6
+    (gen_nro_fl23\<module>\table.c keeps the time of the lifted one, so build_nro.py does not lift into that folder; after
+    a change of the module lifter, lift into gen_nro_eh_o2 first and run flags_local.py again)
 
 Why a file can take hours at -O1/-O2: a few lifted functions have tens of thousands of instructions (the largest
 215,493) in one C function with thousands of labels; several LLVM passes are worse than linear in that. Rule used

@@ -1,6 +1,7 @@
 """The lifted main with the condition flags in a local (runtime\\flags_local.h).
 
     python flags_local.py [src_gen] [dst_gen]        default gen_eh_o2 -> gen_fl
+    python flags_local.py gen_nro_eh_o2 gen_nro_fl23  the script modules: every subfolder (one per module) the same way
 
 Rewrites every generated file of src_gen into dst_gen (only files whose result changed are written, so the compile stays
 incremental) and copies the others (funcs.h, table.c, imports.c, ...). In each lifted function: `FlagsL fl_; FL_IN();` after
@@ -12,7 +13,7 @@ import re
 import shutil
 import sys
 
-LEAVE = re.compile(r'\b(f_[0-9a-f]+|u_[0-9a-f]+|call_indirect|host_import|guest_svc|guest_unimpl|guest_trap|nro_catch_call|stx_diag)\s*\(|\breturn\b')
+LEAVE = re.compile(r'\b(f_[0-9a-f]+|u_[0-9a-f]+|call_indirect|host_import|guest_svc|guest_unimpl|guest_trap|nro_catch_call|nro_import|stx_diag)\s*\(|\breturn\b')
 HELPER_NAMES = ('adds64', 'adds32', 'logic64', 'logic32', 'set_nzcv', 'cond', 'fcmp')
 HELPERS = [(re.compile(r'\b%s\(c,' % h), '%sf(&fl_,' % h) for h in HELPER_NAMES]
 FLAG_FIELD = re.compile(r'\bc->([NZCV])\b')
@@ -84,14 +85,16 @@ def check_helpers():
         sys.exit('flags_local: runtime.h helpers touching the flags without an fl_ version: %s' % ', '.join(missing))
 
 
-def main():
-    check_helpers()
-    src = sys.argv[1] if len(sys.argv) > 1 else 'gen_eh_o2'
-    dst = sys.argv[2] if len(sys.argv) > 2 else 'gen_fl'
+def convert(src, dst):
+    """Transform one generated folder (and its subfolders: the modules of gen_nro_*). Returns (written, unchanged)."""
     os.makedirs(dst, exist_ok=True)
     changed = same = 0
     for name in sorted(os.listdir(src)):
         s, d = os.path.join(src, name), os.path.join(dst, name)
+        if os.path.isdir(s):
+            c, u = convert(s, d)
+            changed, same = changed + c, same + u
+            continue
         if not os.path.isfile(s):
             continue
         if re.match(r'^c_[0-9a-f]+\.c$', name):
@@ -106,7 +109,15 @@ def main():
                 f.write(text)
             changed += 1
         elif not os.path.exists(d) or os.path.getmtime(d) < os.path.getmtime(s):
-            shutil.copy2(s, d)
+            shutil.copy2(s, d)      # keeps the time: table.c is build_nro.py's lift stamp, a newer copy must not look older than the lifter
+    return changed, same
+
+
+def main():
+    check_helpers()
+    src = sys.argv[1] if len(sys.argv) > 1 else 'gen_eh_o2'
+    dst = sys.argv[2] if len(sys.argv) > 2 else 'gen_fl'
+    changed, same = convert(src, dst)
     print('flags_local: %d files written, %d unchanged -> %s' % (changed, same, dst))
 
 
