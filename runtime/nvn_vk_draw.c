@@ -378,6 +378,9 @@ static void acopy(uint8_t *dst, const uint8_t *src, size_t n) {
     WakeConditionVariable(&g_acq_cv);
     g_acq_jobs++; g_acq_bytes += (LONG64)n;
 }
+static void acopy_big(void *dst, const void *src, size_t n) {      /* in pieces of 128 KB, so the helpers (and the render thread at the flush) share a large range */
+    for (size_t o = 0; o < n; o += 128u << 10) acopy((uint8_t *)dst + o, (const uint8_t *)src + o, n - o < (128u << 10) ? n - o : 128u << 10);
+}
 static LONG64 g_sb[9], g_sb_stale, g_genb[6];       /* "nvn_vk_stream:" line every 300 frames: bytes into the ring by kind (c2, code, ubo, ssbo, vbuf, ibuf, compute, texture), ranges copied again although the same range was copied in an earlier generation, generation changes by reason */
 static int g_scat = 7;
 static uint64_t ring_raw(const void *p, uint64_t n) {
@@ -1458,8 +1461,9 @@ static void set_dynamic_state3(int samples) {
  * when the render thread is idle or a sync is waited for. The OpenGL path copies back before the next draw; what guest
  * memory holds once the batch is done is the same. Anything that reads guest memory through a range that only partly lies
  * in a CB forces the copy-back at once (cb_sync: submit, wait; counted). */
-typedef struct { uint64_t addr, size, cap, busy; VkBuffer buf; VMem mem; int state, dirty; uint8_t *snap; uint64_t snap_cap; } CB;     /* state: 0 free, 1 live in this batch, 2 pending (batch submitted); snap: guest memory as it was when the CB was filled */
+typedef struct { uint64_t addr, size, cap, busy; VkBuffer buf; VMem mem; int state, dirty; uint8_t *snap; uint64_t snap_cap; int mode; uint64_t ww_stamp; uint32_t head_n, tail_n; } CB;     /* state: 0 free, 1 live in this batch, 2 pending (batch submitted); snap: guest memory as it was when the CB was filled; mode: how it goes back (0 whole range, 1 merge with snap, 2 write watch) */
 static int g_cb_merge = -1;                        /* SSBU_VK_CBMERGE=0: the whole range is copied back as before session 5 */
+static int g_cb_ww = -1;                           /* SSBU_VK_CBWW=0: the snapshot even where the write watch could tell (session 12) */
 static CB g_cb[256];
 static int g_cb_live, g_cb_pending, g_cb_cached = -1;
 static int16_t g_cb_live_idx[256];                 /* the CBs with state 1, in index order (cb_inside / cb_overlap walk only these) */
@@ -1474,6 +1478,18 @@ static void cb_masks(void) {                       /* every recorded dispatch ha
     }
     g_ncdisp = 0;
 }
+/* Mode 1's merge of n bytes: a word compute changed (map != snapshot) goes to the guest unless the guest changed it too
+ * (counted as a conflict); a word only the guest changed is kept (counted); the bytes after the last whole word are copied. */
+static void cb_merge(uint8_t *guest, const uint8_t *snap, const uint8_t *map, size_t n, LONG64 *gw, LONG64 *cf) {
+    size_t nw = n / 8, tail = n & 7;
+    for (size_t k = 0; k < nw; k++) {
+        uint64_t sv, mv, gv;
+        memcpy(&sv, snap + k * 8, 8); memcpy(&mv, map + k * 8, 8); memcpy(&gv, guest + k * 8, 8);
+        if (mv == sv) { if (gv != sv) (*gw)++; continue; }
+        if (gv == sv) memcpy(guest + k * 8, &mv, 8); else { (*gw)++; (*cf)++; }
+    }
+    if (tail) memcpy(guest + nw * 8, map + nw * 8, tail);
+}
 static uint32_t g_cb_epoch;
 /* midbatch: the command being prepared may still name a freed CB's buffer (it is recorded into the next submission), so
  * that buffer is not given out again before that submission has finished. */
@@ -1484,7 +1500,33 @@ static void cb_land(int midbatch) {                /* the GPU has finished every
     for (int i = 0; i < 256; i++) {
         CB *c = &g_cb[i];
         if (!c->state) continue;
-        if (c->dirty && !c->snap) { memcpy(P(c->addr), c->mem.map, (size_t)c->size); R.cb_bytes += (LONG64)c->size; }
+        if (c->dirty && c->mode == 2) {
+            /* Session 12 (write watch, see cb_new): no snapshot of the whole range. A page the guest has not written since the
+             * CB was filled holds what the CB was filled with, so the CB's bytes are that page's new content (what compute
+             * did not change is the same); those copies run on the copy helpers (acopy_flush at the end). The first and the
+             * last page, when the range covers them only partly, can hold other data the guest writes (measured: small ranges
+             * on a page with the game's per-frame data): their part of the range was saved at the fill and is merged word by
+             * word as in mode 1. A page wholly inside the range that the guest wrote meanwhile (not seen in the measured runs)
+             * keeps the guest's bytes and is counted. */
+            uint64_t newest = nvn_front_ww_newest(P(c->addr), (size_t)c->size);
+            if (newest && newest <= c->ww_stamp) acopy_big(P(c->addr), c->mem.map, (size_t)c->size);
+            else {
+                uint64_t a = c->addr, end = c->addr + c->size;
+                LONG64 gw = 0, cf = 0;
+                while (a < end) {
+                    uint64_t pe = ((uint64_t)(uintptr_t)P(a) | 4095) + 1, n = (uint64_t)(uintptr_t)P(end) < pe ? end - a : pe - (uint64_t)(uintptr_t)P(a);
+                    uint8_t *g = P(a); const uint8_t *m = (const uint8_t *)c->mem.map + (a - c->addr);
+                    if (nvn_front_ww_page((uint64_t)(uintptr_t)g >> 12) <= c->ww_stamp) memcpy(g, m, (size_t)n);
+                    else if (a == c->addr && c->head_n) cb_merge(g, c->snap, m, c->head_n, &gw, &cf);
+                    else if (a + n == end && c->tail_n) cb_merge(g, c->snap + 4096, m, c->tail_n, &gw, &cf);
+                    else { gw += (LONG64)(n / 8); static int nl; if (nl++ < 10) printf("nvn_vk: copy-back of %llx+%llu: the guest wrote page %llx while it was pending; its bytes kept\n", (unsigned long long)c->addr, (unsigned long long)c->size, (unsigned long long)a); }
+                    a += n;
+                }
+                R.cb_guest_words += gw; R.cb_conflict_words += cf;
+            }
+            R.cb_bytes += (LONG64)c->size;
+        }
+        else if (c->dirty && c->mode == 0) { memcpy(P(c->addr), c->mem.map, (size_t)c->size); R.cb_bytes += (LONG64)c->size; }
         else if (c->dirty) {
             /* Session 5: the copy-back is DEFERRED (up to the next batch), so the guest may have written into the range since
              * the CB was filled. Only what compute changed goes back: a word the guest changed meanwhile (guest != snapshot)
@@ -1506,6 +1548,7 @@ static void cb_land(int midbatch) {                /* the GPU has finished every
         c->state = c->dirty = 0;
         c->busy = midbatch ? R.serial + 1 : 0;
     }
+    acopy_flush();                                 /* the copies into guest memory queued above are done */
     g_cb_live = g_cb_pending = 0; g_cb_nlive = 0;
     nvn_front_ccmp_landed();                       /* SSBU_COMPUTE_CMP: what the dispatches wrote is in guest memory now */
     g_cb_epoch++;
@@ -1582,7 +1625,26 @@ static CB *cb_new(uint64_t addr, uint64_t size) {
         while (j > 0 && g_cb_live_idx[j - 1] > ci) { g_cb_live_idx[j] = g_cb_live_idx[j - 1]; j--; }
         g_cb_live_idx[j] = ci; }
     if (g_cb_merge < 0) g_cb_merge = !(getenv("SSBU_VK_CBMERGE") && !atoi(getenv("SSBU_VK_CBMERGE")));
-    if (g_cb_merge) {                              /* the snapshot the copy-back is compared with (cb_land) */
+    if (g_cb_ww < 0) g_cb_ww = !(getenv("SSBU_VK_CBWW") && !atoi(getenv("SSBU_VK_CBWW")));
+    /* Session 12: when the range is write-watched (the game's heap), no snapshot: the write watch is asked now (that
+     * resets it for these pages) and at the copy-back, which tells whether the guest wrote the range meanwhile (cb_land).
+     * The CB is filled on the copy helpers (done before the command buffer goes to the queue: cmd_submit). Measured in a
+     * heavy fight (gaogaen / bayonetta, Midgar): 17 dispatches, 2.9 MB per frame; with the two copies on the render thread
+     * and the word-by-word merge the dispatches took 2.0 ms of its frame, now 0.4 (render thread 7.6 -> 6.1 ms per frame,
+     * 91 -> 102 fps). Ranges under 16 KB keep the snapshot. SSBU_VK_CBWW=0: the snapshot as before. */
+    c->mode = 0;
+    if (g_cb_merge && g_cb_ww && size >= (16u << 10) && nvn_front_ww_newest(P(addr), (size_t)size)) {      /* small ranges: the snapshot (cheap) */
+        /* the parts of a first / last page the range covers only partly: saved for the word merge (cb_land) */
+        uint64_t ga = (uint64_t)(uintptr_t)P(addr), ge = ga + size, hp = (ga | 4095) + 1;
+        c->mode = 2; c->ww_stamp = nvn_front_ww_now();
+        c->head_n = (ga & 4095) || ge < hp ? (uint32_t)((ge < hp ? ge : hp) - ga) : 0;
+        c->tail_n = (ge & 4095) && (ge - 1) >> 12 != ga >> 12 ? (uint32_t)(ge & 4095) : 0;
+        if (c->snap_cap < 8192) { free(c->snap); c->snap_cap = 8192; c->snap = malloc(8192); }
+        if (c->head_n) memcpy(c->snap, P(addr), c->head_n);
+        if (c->tail_n) memcpy(c->snap + 4096, P(addr + size - c->tail_n), c->tail_n);
+        acopy_big(c->mem.map, P(addr), (size_t)size);
+    } else if (g_cb_merge) {                       /* the snapshot the copy-back is compared with (cb_land) */
+        c->mode = 1;
         if (c->snap_cap < size) { free(c->snap); c->snap_cap = (size + 4095) & ~(uint64_t)4095; c->snap = malloc((size_t)c->snap_cap); }
         memcpy(c->snap, P(addr), (size_t)size);
         memcpy(c->mem.map, c->snap, (size_t)size);
@@ -1734,10 +1796,16 @@ static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uin
         d->wm_off = wm_off; d->written = v->ssbo_w; memcpy(d->cb, wcb, sizeof wcb);
     }
 }
+/* SSBU_VK_DPSTAT=1 (a measurement): draw preparation split into its steps (one more "nvn_vk_dprep:" line every 300 frames) */
+static int g_dpstat = -1;
+static LONG64 g_dp[8], g_dpt;
+#define DP_MARK(i) do { if (g_dpstat > 0) { LONG64 t_ = tk(); g_dp[i] += t_ - g_dpt; g_dpt = t_; } } while (0)
 /* Everything of a draw up to the draw call. topo: NVN primitive. Returns 0 when the draw cannot be done (counted as skipped). */
 static int draw_prepare(unsigned prim) {
     static const int8_t topo[7] = {VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, -1, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN};
     static const uint8_t tclass[7] = {0, 1, 1, 1, 2, 2, 2};
+    if (g_dpstat < 0) g_dpstat = getenv("SSBU_VK_DPSTAT") && atoi(getenv("SSBU_VK_DPSTAT"));
+    if (g_dpstat > 0) g_dpt = tk();
     if (!R.have_targets || R.render_off) return 0;
     if (prim > 6 || topo[prim] < 0) { static char msg[64]; snprintf(msg, sizeof msg, "a draw with NVN primitive type %u", prim); nvn_vk_missing(msg); return 0; }
     if (!R.prog[0]) return 0;
@@ -1760,10 +1828,12 @@ static int draw_prepare(unsigned prim) {
     if (g_skip_flag) { g_skip_flag = 0; if (!vs || (!depth_only && !fs)) return 0; }      /* shader_wait = skip: the draw is left out (counted in vstage_get) */
     if (!vs || (!depth_only && !fs)) { nvn_vk_missing("a draw whose vertex or fragment stage could not be translated or compiled (the log names the stage)"); return 0; }
 
+    DP_MARK(0);
     /* 1. textures (may upload, change layouts, end the pass) */
     g_ndtex = 0;
     for (int i = 0; i < vs->nsmp; i++) resolve_sampler(0, vs, i);
     if (fs) for (int i = 0; i < fs->nsmp; i++) resolve_sampler(1, fs, i);
+    DP_MARK(1);
     /* 2. buffers: every range the draw reads, into the ring (may wrap the ring = submit) */
     static BufRef bufs[80];
     int nbuf = 0;
@@ -1801,6 +1871,7 @@ static int draw_prepare(unsigned prim) {
         voff[i] = b.off; vbufs[i] = b.buf;
     }
     R.cb_draws += from_cb;
+    DP_MARK(2);
     /* 3. pass and pipeline */
     if (!pass_begin()) return 0;
     PKey k;
@@ -1813,13 +1884,14 @@ static int draw_prepare(unsigned prim) {
     }
     pkey_targets(&k);
     Pipe *p = pipe_get(&k, vs, fs);
-    if (!p) return 0;                              /* shader_wait = skip: the pipeline is being made by a worker, the draw is left out (counted in pipe_get) */
+    if (!p) return 0;                             /* shader_wait = skip: the pipeline is being made by a worker, the draw is left out (counted in pipe_get) */
     if (!R.pipe_bound) R.dyn3_dirty = 1;          /* a new command buffer, or a pipeline of our own with static state was bound */
     if (R.pipe_bound != p) { vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->p); R.pipe_bound = p; }
     if (R.dyn_dirty) { set_dynamic_state(); R.dyn_dirty = 0; }
     if (D.has_eds3 && (R.dyn3_dirty || R.dyn3_samples != k.samples)) { set_dynamic_state3(k.samples); R.dyn3_dirty = 0; }
     vkCmdSetPrimitiveTopology(R.cmd, (VkPrimitiveTopology)topo[prim]);
     vkCmdSetPrimitiveRestartEnable(R.cmd, R.restart && (D.has_plr || prim == 3 || prim == 5 || prim == 6));
+    DP_MARK(3);
     /* 4. vertex input */
     {
         VkVertexInputBindingDescription2EXT bd[17];
@@ -1858,6 +1930,7 @@ static int draw_prepare(unsigned prim) {
         vkCmdSetVertexInputEXT(R.cmd, nb, bd, na, ad);
         if (nb) vkCmdBindVertexBuffers(R.cmd, 0, nb, vb, vo);
     }
+    DP_MARK(4);
     /* 5. descriptors */
     {
         static VkWriteDescriptorSet w[220];
@@ -1922,8 +1995,10 @@ static int draw_prepare(unsigned prim) {
             float fcs = R.pass_rs ? 1.0f / R.pass_sx : 1.0f, ps = R.pass_rs ? R.point_size * R.pass_sx : R.point_size;
             memcpy(&pc[3], &fcs, 4); memcpy(&pc[2], &ps, 4);
         }
+        DP_MARK(5);
         vkCmdPushConstants(R.cmd, p->layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, pc);
     }
+    DP_MARK(6);
     return 1;
 }
 
@@ -2824,6 +2899,10 @@ handed:
                    (long long)frame - 300, (long long)frame, (g_sb[0] - sl[0]) / 307200.0, (g_sb[1] - sl[1]) / 307200.0, (g_sb[2] - sl[2]) / 307200.0, (g_sb[3] - sl[3]) / 307200.0, (g_sb[4] - sl[4]) / 307200.0, (g_sb[5] - sl[5]) / 307200.0, (g_sb[6] - sl[6]) / 307200.0, (g_sb[7] - sl[7]) / 307200.0,
                    (g_sb_stale - stl) / 307200.0, (g_genb[0] - gl[0]) / 300.0, (g_genb[1] - gl[1]) / 300.0, (g_genb[2] - gl[2]) / 300.0, (g_genb[3] - gl[3]) / 300.0, (g_genb[4] - gl[4]) / 300.0, (g_genb[5] - gl[5]) / 300.0, (R.cb_bytes - cbl) / 307200.0, (long long)g_rch_waits, (double)g_rch_wait_tk * 1000.0 / (double)fq.QuadPart, (long long)g_rch_drains, (long long)g_acq_jobs, (double)g_acq_bytes / 1048576.0, (double)g_acq_wait_tk * 1000.0 / (double)fq.QuadPart);
             memcpy(sl, g_sb, sizeof sl); stl = g_sb_stale; memcpy(gl, g_genb, sizeof gl); cbl = R.cb_bytes; }
+        if (g_dpstat > 0) { static LONG64 dl[8];
+            printf("nvn_vk_dprep: frames %lld..%lld ms/frame: stages %.2f, textures %.2f, buffers %.2f, pass + pipeline + state %.2f, vertex input %.2f, descriptors %.2f, push constants %.2f\n", (long long)frame - 300, (long long)frame,
+                   (g_dp[0] - dl[0]) * k, (g_dp[1] - dl[1]) * k, (g_dp[2] - dl[2]) * k, (g_dp[3] - dl[3]) * k, (g_dp[4] - dl[4]) * k, (g_dp[5] - dl[5]) * k, (g_dp[6] - dl[6]) * k);
+            memcpy(dl, g_dp, sizeof dl); }
         if (frame % 3000 == 0) m4_report();
         memcpy(last, g_tm, sizeof last); last_sets = R.sets; last_flush = R.flushes; last_reused = R.sets_reused; last_disp = R.dispatches;
     }

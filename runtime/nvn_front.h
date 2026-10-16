@@ -127,6 +127,9 @@ int nvn_front_tex_levels(const Tex *t);                                     /* l
 /* 1 when the guest memory of the texture must be read (again): first use, or written since the last look. `commit` = the
  * caller uploads now (the texture's hash and stamps are then updated). */
 int nvn_front_tex_changed(Tex *t);
+uint64_t nvn_front_ww_newest(const void *p, size_t n);                      /* write-watch stamps (nvn_gl.c ww_newest; render thread only) */
+uint64_t nvn_front_ww_now(void);
+uint64_t nvn_front_ww_page(uint64_t page);                                  /* stamp of a page seen written, 0 = no write on record */
 /* Calls put() once per (level, layer) with tightly packed texels de-swizzled from the texture's memory; decode != 0 turns
  * every level into RGBA8 with tex_decode_rgba8 (rgba8 = 1 in the call). Returns 0 when the memory is not readable. */
 typedef void nvn_front_put_fn(Tex *t, int level, int layer, int w, int h, int d, const void *data, size_t size, int rgba8, int64_t row_stride);

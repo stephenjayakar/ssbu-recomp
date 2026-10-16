@@ -5029,6 +5029,14 @@ int nvn_front_tex_levels(const Tex *t) {
     return b->samples > 1 ? 1 : levels > maxl ? maxl : levels;
 }
 /* The decision of tex_sync without its OpenGL calls (the same rule, the same fields of Tex). */
+/* Write-watch services for the Vulkan back end (render thread only, as ww_newest). nvn_front_ww_newest: newest write stamp
+ * of the pages of [p, p+n) (0 = not write-watched); nvn_front_ww_now: the newest stamp given so far (a range whose newest
+ * stamp is not above a value read from here after a look has not been written since that look); nvn_front_ww_page: the
+ * stamp a look gave one page (page = address >> 12) when it found it written, 0 when no write of it is on record (also
+ * after the table was emptied, see g_ww_floor). */
+uint64_t nvn_front_ww_newest(const void *p, size_t n) { return ww_newest((const uint8_t *)p, n); }
+uint64_t nvn_front_ww_now(void) { return g_ww_stamp; }
+uint64_t nvn_front_ww_page(uint64_t page) { uint64_t *s = g_ww_tab ? ww_slot(page, 0) : NULL; return s ? *s : 0; }
 int nvn_front_tex_changed(Tex *t) {
     Fmt f;
     if (t->checked == g_serial) return 0;
