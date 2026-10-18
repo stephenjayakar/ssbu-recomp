@@ -519,6 +519,7 @@ void os_thread_report(FILE *out);            /* os_threads.c: every thread the g
 void module_coverage_report(FILE *out);      /* nnro.c: script module functions that ran (SSBU_MODCOV=1) */
 
 void (*g_exit_report_hook)(FILE *);          /* a test's own last line (nnsdk2.c eh_main_test) */
+void (*g_plugin_report_hook)(void);          /* skyline.c: how often the plugins' hooks ran */
 
 /* hostrt.h log_cap_begin: measured on the render thread (run "diag tailtime"): the reports after a present took 3.4 ms every
  * 300 frames, 5.5 ms every 600 and 11 ms every 3000 (25-60 printf calls each, one WriteFile apiece): a long frame every 2.5 s
@@ -564,6 +565,7 @@ int log_printf(const char *fmt, ...) {
 
 void report_and_exit(int code) {
     if (g_exit_report_hook) g_exit_report_hook(stdout);
+    if (g_plugin_report_hook) g_plugin_report_hook();
     audit_exit_counts();
     print_import_summary(stdout);
     print_hostfn_summary(stdout);
