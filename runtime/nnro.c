@@ -432,7 +432,14 @@ static int attach_dll(NroModule *m) {
      * gen_nro_eh_o2 gen_nro_fl23, then build_opt.py nro with RECOMP_NRO_SUFFIX=_fl23) are taken when there, else the
      * optimised ones of 2026-10-09 (nro_bin_eh_o2); SSBU_NRO_BIN=nro_bin_eh = the -O0 ones */
     snprintf(path + n, sizeof path - n, "%s\\%s.dll", bin && bin[0] ? bin : "nro_bin_fl23", m->info->name);
-    HMODULE dll = LoadLibraryA(path);
+    HMODULE dll = NULL;
+    if (!m->plugin && sky_registry() > 0) {                 /* skyline.c: a module re-lifted with the plugins' sites (nro_bin_hdr) */
+        char hp[MAX_PATH * 2];
+        snprintf(hp, sizeof hp, "%.*snro_bin_hdr\%s.dll", (int)n, path, m->info->name);
+        dll = LoadLibraryA(hp);
+        if (dll) printf("nn::ro: %s from %s\n", m->info->name, hp);
+    }
+    if (!dll) dll = LoadLibraryA(path);
     if (!dll && !(bin && bin[0])) { snprintf(path + n, sizeof path - n, "nro_bin_eh_o2\\%s.dll", m->info->name); dll = LoadLibraryA(path); }
     const char *python = getenv("SSBU_NRO_AUTOBUILD");       /* development aid: path of python.exe; lift a missing module on demand */
     if (!dll && python && python[0]) {
