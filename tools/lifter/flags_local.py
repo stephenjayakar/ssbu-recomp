@@ -13,12 +13,14 @@ import re
 import shutil
 import sys
 
-LEAVE = re.compile(r'\b(f_[0-9a-f]+|u_[0-9a-f]+|call_indirect|host_import|guest_svc|guest_unimpl|guest_trap|nro_catch_call|nro_import|stx_diag)\s*\(|\breturn\b')
+# sky_site_inline / sky_site_midhook: callouts of a DLL re-lifted from a site list (relift_sites.py); a plain lift has none,
+# so its output is unchanged
+LEAVE = re.compile(r'\b(f_[0-9a-f]+|u_[0-9a-f]+|call_indirect|host_import|guest_svc|guest_unimpl|guest_trap|nro_catch_call|nro_import|stx_diag|sky_site_inline|sky_site_midhook)\s*\(|\breturn\b')
 HELPER_NAMES = ('adds64', 'adds32', 'logic64', 'logic32', 'set_nzcv', 'cond', 'fcmp')
 HELPERS = [(re.compile(r'\b%s\(c,' % h), '%sf(&fl_,' % h) for h in HELPER_NAMES]
 FLAG_FIELD = re.compile(r'\bc->([NZCV])\b')
 FN_OPEN = re.compile(r'^void [uf]_[0-9a-f]+\(Ctx \*c(, uint64_t rp)?\) \{$')
-STMT = re.compile(r'^(L_[0-9a-f]+: |  case 0x[0-9a-f]+ULL: |  default: |  )(.*)$')
+STMT = re.compile(r'^(L_[0-9a-f]+(?:_m)?: |  case 0x[0-9a-f]+ULL: |  default: |  )(.*)$')      # L_<pc>_m: relift_sites.py
 
 
 def transform(text):
