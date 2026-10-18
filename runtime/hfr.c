@@ -68,13 +68,26 @@ static unsigned g_rate = HFR_RATE;                    /* TEST: SSBU_HFR_RATE */
  * battle often follows the final hit: the step does not take a new N while it lasts, measured 95 updates); a new request
  * above 1 ends the hold at once. Those steps run at 60 Hz (the clock follows g_doubled_now). MEASURED (run30, 3 stock
  * fights): N 8 -> stop 93 updates -> N 1 for 8 steps -> N 2, then the "GAME" request (90, falling to 1) and the results,
- * every fight. The "GAME" slow motion's 90 doubles to 100 only (the step's clamp): its first cycle is 0.83 s, not 1.5. */
+ * every fight. Since the end of the match below, this hold is left for slow motions within a match (a hard hit, a
+ * fighter's special: N 16 -> 1 for 8 steps -> 2 measured with Ness and Captain Falcon, the fight went on). */
 #define STOP_WORD 0x71052b82e8ULL                     /* nonzero: the battle is stopped (the step skips its slow bookkeeping) */
 #define HOLD_STEPS 8
 static unsigned g_last_req = 1;                        /* the game's own request maximum at its last call (battle thread) */
 static int g_hold, g_hold_done;                        /* holding N at 1; steps of the hold with N = 1 and no stop */
 static int g_hold_steps = HOLD_STEPS;                  /* TEST: SSBU_HFR_HOLD */
 static LONG64 g_holds;
+/* The end of the match. Once the FighterManager's is_ready_go (impl + 0xd2) has been set in this battle and is clear again
+ * (the final hit, the end of the time, a quit from the pause menu) the divisor is not doubled any more: whatever the game
+ * does from there to the end of the battle scene (the final hit's slow motion, "GAME", the way to the results or back to
+ * the select screen) runs as on the console, at 60 Hz. A quit from the pause menu ends the match without any slow request,
+ * so the hold above never starts there [the user's report 2026-10-18: quitting left the game in the battle scene at 120
+ * Hz; reproduced: runQ9off stayed on NO CONTEST, runQ9on went back to the select screen 3 times of 3]. With the hold alone
+ * the stock matches did end (run30), but this is simpler and the same for every way a match ends. MEASURED: stock matches
+ * through "GAME" to the results (runA2, runB, runC, runT2: 20 fights), a time-out through sudden death (run32). A sudden
+ * death sets is_ready_go again and runs at 120 Hz. TEST: SSBU_HFR_OVER=0 turns this off. */
+static int g_go_seen, g_over, g_over_on = 1;
+static uint64_t g_fm_inst;                             /* &lib::Singleton<app::FighterManager>::instance_ */
+uint64_t hook_address(const char *name);              /* fighter_sdk\hook_host.c (included by nnro.c) */
 static int g_trace;                                    /* TEST ONLY, SSBU_HFR_TRACE=1: changes of the slow state, requests above 1, the holds */
 static ImportFn g_orig_step, g_orig_max, g_orig_timer_init;
 static volatile uint64_t g_timer_comp;                  /* the rule component, from its init */
@@ -100,8 +113,17 @@ static void slow_step_hook(Ctx *c, void *user) {
     (void)user;
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    if (!battle_running(now.QuadPart)) { g_battles++; g_hold = 0; g_last_req = 1; }
-    if (rd8(SLOW + 5) < 2) {                           /* N asked for is 1: never a doubled value, so the game set it (a battle's set-up does, after
+    if (!battle_running(now.QuadPart)) { g_battles++; g_hold = 0; g_last_req = 1; g_go_seen = g_over = 0; }
+    if (!g_fm_inst) g_fm_inst = hook_address("_ZN3lib9SingletonIN3app14FighterManagerEE9instance_E");
+    uint64_t fm = g_fm_inst ? rd64(g_fm_inst) : 0, fmi = fm ? rd64(fm) : 0;
+    if (fmi && rd8(fmi + 0xd2)) {
+        if (g_over && g_trace) printf("hfr-trace: is_ready_go set again at update %lld: doubling\n", (long long)g_steps);
+        g_go_seen = 1; g_over = 0;
+    } else if (fmi && g_go_seen && !g_over && g_over_on) {
+        g_over = 1;
+        if (g_trace) printf("hfr-trace: the match is over at update %lld (is_ready_go clear): no doubling\n", (long long)g_steps);
+    }
+    if (rd8(SLOW + 5) < 2 || g_over) {                           /* N asked for is 1: never a doubled value, so the game set it (a battle's set-up does, after
                                                         * its first updates: measured 2026-10-15); have the step ask the request maximum again */
         uint64_t t = rd64(SLOW_TABLE_PTR);
         if (t) wr8(t + 0x40, 1);
@@ -136,6 +158,7 @@ static void slow_step_hook(Ctx *c, void *user) {
     }
     InterlockedExchange(&g_doubled_now, rd8(SLOW + 4) >= 2);
     if (g_doubled_now) wr32(UPDATE_RATE, g_rate);   /* the battle's managers: 60 / rate frames per update (set-up writes 60 here again) */
+    else if (rd32(UPDATE_RATE) == g_rate) wr32(UPDATE_RATE, 60);   /* N = 1 (a hold): console updates at a 60 Hz clock */
     if (added) {
         memcpy((void *)(uintptr_t)rb, keep, sizeof keep);
         g_added++;
@@ -164,7 +187,7 @@ static void slow_max_hook(Ctx *c, void *user) {
     }
     if (n > 1) g_hold = 0;
     g_last_req = n;
-    if (g_hold) { c->x[0] = 1; return; }
+    if (g_hold || g_over) { c->x[0] = n; return; }
     c->x[0] = n * 2 > 100 ? 100 : n * 2;              /* the step clamps to 1..100 as well */
     g_doubled++;
 }
@@ -192,6 +215,7 @@ void hfr_init(void) {
     if (!a || !b) { printf("hfr: frame_rate = 120 asked for, but a hook failed (step %d, request maximum %d): 60 is used\n", a, b); return; }
     hook_install(FN_TIMER_INIT, timer_init_hook, NULL, &g_orig_timer_init);
     if (getenv("SSBU_HFR_HOLD")) g_hold_steps = atoi(getenv("SSBU_HFR_HOLD"));      /* TEST ONLY */
+    if (getenv("SSBU_HFR_OVER")) g_over_on = atoi(getenv("SSBU_HFR_OVER")) != 0;      /* TEST ONLY */
     g_trace = getenv("SSBU_HFR_TRACE") && atoi(getenv("SSBU_HFR_TRACE")) != 0;
     if (getenv("SSBU_HFR_RATE")) g_rate = (unsigned)atoi(getenv("SSBU_HFR_RATE"));
     g_setting = 120;
@@ -202,6 +226,10 @@ void hfr_init(void) {
  * picture while the update rate is ours (see UPDATE_RATE). */
 void hfr_picture(void) {
     if (g_setting != 120 || rd32(UPDATE_RATE) != HFR_RATE) return;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (!battle_running(now.QuadPart)) { wr32(UPDATE_RATE, 60); return; }     /* the battle has stopped (a quit from the pause menu ends it
+                                                                              * without the set-up of another one): the console's rate again */
     wr32(UPDATE_ACC, rd32(UPDATE_ACC) + (HFR_RATE - 60));
 }
 

@@ -104,7 +104,7 @@ static int script_key(int vk) {
  *   <n>:<keys>[/<h>]  wait n polls, then hold the keys for h polls (default 8); keys as in SSBU_SCRIPT
  * Example: "@movie 90:Z 120:Z @draws:150-200 300:u/40 10:Z". Each step is announced with the poll number and the
  * draw count of the last frame. tests\seq_battle.txt is the sequence from boot to a battle (tests\run_battle.sh). */
-#define SEQ_MAX 256
+#define SEQ_MAX 4096                                  /* was 256: a 9-fight sweep (gen_sweep.py) has ~410 steps and stopped in its 6th fight */
 #define MARK_MAX 128
 enum { SEQ_KEYS = 0, SEQ_MARK, SEQ_DRAWS, SEQ_UNTIL };
 static struct { int wait, hold, kind, lo, hi, need; char keys[12]; char mark[40]; } g_seq[SEQ_MAX];
@@ -160,6 +160,7 @@ static void seq_tick(void) {                              /* once per poll of pl
             } else if (sscanf(tok, "%d:%11[^/]/%d", &g_seq[g_seq_count].wait, g_seq[g_seq_count].keys, &g_seq[g_seq_count].hold) < 1) { printf("input sequence: bad step %s\n", tok); break; }
             g_seq_count++;
         }
+        if (s && *s && g_seq_count == SEQ_MAX) printf("input sequence: more than %d steps: the rest is left out\n", SEQ_MAX);
         if (g_seq_count) printf("input sequence: %d steps\n", g_seq_count);
         seq_begin(0);
     }
@@ -609,8 +610,19 @@ static void hid_GetNpadStyleSet(Ctx *c) {   /* (const NpadIdType &) */
     }
     RET(r ? STYLE_FULLKEY : 0);
 }
-static void hid_GetNpadState_FullKey(Ctx *c) { fill_pad(A0, rd32(A1), 1); }
-static void hid_GetNpadState_Other(Ctx *c) { fill_pad(A0, rd32(A1), 0); }
+static void hidlog_state(Ctx *c, int fullkey) {              /* D2 debug (SSBU_HIDLOG): each distinct (id, style, caller) of GetNpadState once */
+    static int on = -1, n; static uint64_t seen[256];
+    if (on < 0) on = getenv("SSBU_HIDLOG") != NULL;
+    if (!on) return;
+    static LONG64 calls;
+    if (++calls % 5000 == 0) printf("hidlog: %lld GetNpadState calls (now id %x from %llx)\n", (long long)calls, rd32(A1), (unsigned long long)c->x[30] - 4);
+    uint32_t id = rd32(A1);
+    uint64_t k = ((uint64_t)id << 48) ^ ((uint64_t)fullkey << 47) ^ c->x[30]; int i;
+    for (i = 0; i < n; i++) if (seen[i] == k) break;
+    if (i == n && n < 256) { seen[n++] = k; printf("hidlog: GetNpadState(%s, id %x) from %llx\n", fullkey ? "full key" : "other style", id, (unsigned long long)c->x[30] - 4); }
+}
+static void hid_GetNpadState_FullKey(Ctx *c) { hidlog_state(c, 1); fill_pad(A0, rd32(A1), 1); }
+static void hid_GetNpadState_Other(Ctx *c) { hidlog_state(c, 0); fill_pad(A0, rd32(A1), 0); }
 static void hid_GetPlayerLedPattern(Ctx *c) {               /* the console's patterns for players 1..8 */
     static const uint8_t led[8] = {1, 3, 7, 15, 9, 5, 13, 6};
     uint32_t id = rd32(A0);

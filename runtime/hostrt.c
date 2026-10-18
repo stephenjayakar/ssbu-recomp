@@ -136,6 +136,7 @@ void print_hostfn_summary(FILE *out) {
         for (int j = i; j > 0 && g_hostfn[order[j]].first < g_hostfn[order[j - 1]].first; j--) { int t = order[j]; order[j] = order[j - 1]; order[j - 1] = t; }
     fprintf(out, "\nrun-time host functions: %d handed out, %d called, in order of first call:\n", n, used);
     for (int i = 0; i < used; i++) fprintf(out, "  %8lld  %s\n", (long long)g_hostfn[order[i]].calls, g_hostfn[order[i]].name);
+    if (getenv("SSBU_HOSTFN_ALL")) for (int i = 0; i < n; i++) fprintf(out, "  host function %d at 0x%llx: %s (%lld calls)\n", i, (unsigned long long)(HOSTFN_BASE + (uint64_t)i * 16), g_hostfn[i].name, (long long)g_hostfn[i].calls);      /* TEST: the whole table by index */
     free(order);
 }
 
@@ -601,24 +602,61 @@ void guest_svc(Ctx *c, uint32_t number) {
 /* Session 13: a crash also leaves a minidump next to the exe (<exe>_crash.dmp: threads, stacks, the memory they point
  * at; not the whole 5+ GB address space), written before anything else so that a crash inside the report still leaves
  * evidence. */
+/* The dump is written by a helper thread (MiniDumpWriteDump on the faulting thread itself left 0-byte files: measured in
+ * the play crashes of 2026-10-18), with a small dump type (threads, stacks, modules, handles: the guest heap of 8 GB is not
+ * wanted). */
+typedef struct { DWORD ThreadId; EXCEPTION_POINTERS *ExceptionPointers; BOOL ClientPointers; } CrashMDEI;
+typedef BOOL (WINAPI *CrashMDWD)(HANDLE, DWORD, HANDLE, int, CrashMDEI *, void *, void *);
+static struct { CrashMDWD f; HANDLE fh; CrashMDEI mi; BOOL ok; DWORD err; } g_md;
+static DWORD WINAPI crash_minidump_thread(void *arg) {
+    (void)arg;
+    g_md.ok = g_md.f(GetCurrentProcess(), GetCurrentProcessId(), g_md.fh, 0x1000 /* WithThreadInfo */ | 0x4 /* WithHandleData */ | 0x20 /* WithUnloadedModules */, &g_md.mi, NULL, NULL);
+    g_md.err = g_md.ok ? 0 : GetLastError();
+    return 0;
+}
 static void crash_minidump(EXCEPTION_POINTERS *ep) {
-    typedef struct { DWORD ThreadId; EXCEPTION_POINTERS *ExceptionPointers; BOOL ClientPointers; } MDEI;
-    typedef BOOL (WINAPI *MDWD)(HANDLE, DWORD, HANDLE, int, MDEI *, void *, void *);
     char path[MAX_PATH + 16];
     DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
     if (!n || n >= MAX_PATH) return;
     if (n > 4 && !_stricmp(path + n - 4, ".exe")) path[n - 4] = 0;
     strcat(path, "_crash.dmp");
     HMODULE dh = LoadLibraryA("dbghelp.dll");
-    MDWD f = dh ? (MDWD)(void *)GetProcAddress(dh, "MiniDumpWriteDump") : NULL;
-    if (!f) { printf("crash: no MiniDumpWriteDump (dbghelp.dll)\n"); return; }
-    HANDLE fh = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (fh == INVALID_HANDLE_VALUE) return;
-    MDEI mi = {GetCurrentThreadId(), ep, FALSE};
-    BOOL ok = f(GetCurrentProcess(), GetCurrentProcessId(), fh, 0x1000 /* WithThreadInfo */ | 0x40 /* WithIndirectlyReferencedMemory */ | 0x10 /* ScanMemory */ | 0x4 /* WithHandleData */, &mi, NULL, NULL);
-    CloseHandle(fh);
-    printf("crash: minidump %s %s\n", path, ok ? "written" : "NOT written");
+    g_md.f = dh ? (CrashMDWD)(void *)GetProcAddress(dh, "MiniDumpWriteDump") : NULL;
+    if (!g_md.f) { printf("crash: no MiniDumpWriteDump (dbghelp.dll)\n"); return; }
+    g_md.fh = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (g_md.fh == INVALID_HANDLE_VALUE) { printf("crash: cannot create %s (error %lu)\n", path, GetLastError()); return; }
+    g_md.mi.ThreadId = GetCurrentThreadId(); g_md.mi.ExceptionPointers = ep; g_md.mi.ClientPointers = FALSE;
+    HANDLE th = CreateThread(NULL, 0, crash_minidump_thread, NULL, 0, NULL);
+    DWORD w = th ? WaitForSingleObject(th, 60000) : WAIT_FAILED;
+    if (th) CloseHandle(th);
+    CloseHandle(g_md.fh);
+    printf("crash: minidump %s %s (error %lu%s)\n", path, g_md.ok ? "written" : "NOT written", g_md.err, w == WAIT_OBJECT_0 ? "" : ", the writer did not finish");
     fflush(stdout);
+}
+/* The guest context the faulting lifted code was running on: t_cur_ctx can be another one (a fiber's switch), so the host
+ * registers are searched for a pointer to a Ctx whose last entered function is a guest address. x30 is the caller. */
+static void crash_live_contexts(const CONTEXT *hc) {
+    const struct { const char *n; DWORD64 v; } r[] = {{"rcx", hc->Rcx}, {"rbx", hc->Rbx}, {"rsi", hc->Rsi}, {"rdi", hc->Rdi}, {"rbp", hc->Rbp},
+        {"r12", hc->R12}, {"r13", hc->R13}, {"r14", hc->R14}, {"r15", hc->R15}, {"rdx", hc->Rdx}, {"r8", hc->R8}, {"r9", hc->R9}, {"rax", hc->Rax}};
+    for (int k = 0; k < (int)(sizeof r / sizeof r[0]); k++) {
+        Ctx *c = (Ctx *)(uintptr_t)r[k].v;
+        if (r[k].v < 0x10000 || IsBadReadPtr(c, sizeof *c) || c->fn < 0x7100000000ULL || c->fn >= HOSTFN_BASE || c == t_cur_ctx) continue;
+        int dup = 0;
+        for (int q = 0; q < k; q++) if (r[q].v == r[k].v) dup = 1;
+        if (dup) continue;
+        printf("live guest context in %s: last function entered f_%llx, x30 (the caller) %llx\n", r[k].n, (unsigned long long)c->fn, (unsigned long long)c->x[30]);
+        for (int i = 0; i < 31; i++) printf("  x%-2d %016llx%s", i, (unsigned long long)c->x[i], i % 3 == 2 ? "\n" : "");
+        printf("  sp  %016llx\n", (unsigned long long)c->x[31]);
+        uint64_t sp = c->x[31];                        /* guest return addresses saved on the guest stack (stp x29, x30 frames) */
+        printf("  guest stack words that are guest code addresses:");
+        for (int w = 0, shown = 0; w < 512 && shown < 24; w++) {
+            uint64_t v;
+            if (IsBadReadPtr((void *)(uintptr_t)(sp + 8ull * w), 8)) break;
+            v = *(uint64_t *)(uintptr_t)(sp + 8ull * w);
+            if (((v >= 0x7100000000ULL && v < 0x7104000000ULL) || (v >= 0x7200000000ULL && v < 0x7300000000ULL)) && !(v & 3)) { printf(" %llx", (unsigned long long)v); shown++; }
+        }
+        printf("\n");
+    }
 }
 static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
     EXCEPTION_RECORD *er = ep->ExceptionRecord;
@@ -632,7 +670,11 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
         printf("  %s address 0x%llx\n", er->ExceptionInformation[0] == 1 ? "writing" : "reading",
                (unsigned long long)er->ExceptionInformation[1]);
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->ExceptionInformation[1] >= HOSTFN_BASE && er->ExceptionInformation[1] < HOSTFN_BASE + (uint64_t)g_hostfn_count * 16)
+        printf("  (the placeholder address of the run-time host function %d, %s, +%llu, used as data)\n", (int)((er->ExceptionInformation[1] - HOSTFN_BASE) / 16),
+               g_hostfn[(er->ExceptionInformation[1] - HOSTFN_BASE) / 16].name, (unsigned long long)((er->ExceptionInformation[1] - HOSTFN_BASE) % 16));
     dump_guest_registers();
+    crash_live_contexts(ep->ContextRecord);
     printf("guest call stack (innermost first):\n");
     CONTEXT ctx = *ep->ContextRecord;
     uint64_t last = 0;
@@ -641,7 +683,12 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
         if (g && g != last) { printf("  f_%llx\n", (unsigned long long)g); shown++; last = g; }
         DWORD64 image_base;
         RUNTIME_FUNCTION *rf = RtlLookupFunctionEntry(ctx.Rip, &image_base, NULL);
-        if (!rf) break;
+        if (!rf) {                                     /* a leaf function (no unwind entry): the return address is at rsp */
+            DWORD64 ra = 0;
+            if (depth > 0 || IsBadReadPtr((void *)ctx.Rsp, 8)) break;
+            ra = *(DWORD64 *)ctx.Rsp; ctx.Rsp += 8; ctx.Rip = ra;
+            continue;
+        }
         void *handler_data;
         DWORD64 establisher;
         RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, rf, &ctx, &handler_data, &establisher, NULL);
@@ -683,6 +730,13 @@ void runtime_init(const char *elf, const char *trace_path) {
     /* data symbols provided by other modules: zero-filled placeholders, IMPORT_SLOT bytes each */
     void *imp = VirtualAlloc((void *)IMPORT_BASE, (SIZE_T)dyn_sym_count * IMPORT_SLOT, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (imp != (void *)IMPORT_BASE) { fprintf(stderr, "cannot map import area\n"); exit(1); }
+    /* The placeholder addresses of the run-time host functions are readable (zeros), as code is on the console. HDR reads one
+     * of them as data: lib::L2CValue::as_integer (0x7103734b80) on 0x7400004220 (run-time host function 1058 in the HDR
+     * install; on the console the address of that function is code). There it reads instruction words, which are no
+     * L2CValue type (2, 3, 7), and gives 0; here the address was unmapped and the game died with an access
+     * violation every couple of minutes of play (2026-10-18, nine crashes, any fighters). Zeros read as type 0: also 0.
+     * Writes still fault, as they would on the console's code pages. */
+    if (!VirtualAlloc((void *)HOSTFN_BASE, (SIZE_T)MAX_HOSTFN * 16, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY)) printf("hostrt: the host function placeholders could not be mapped readable (error %lu)\n", GetLastError());
     FILE *f = fopen(elf, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", elf); exit(1); }
     fseek(f, (long)FILE_OFF, SEEK_SET);
