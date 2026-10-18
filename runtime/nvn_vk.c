@@ -135,9 +135,11 @@ static const char *vk_result_name(VkResult r) {
     snprintf(buf, sizeof buf, "VkResult %d", (int)r);
     return buf;
 }
+static void (*g_vk_lost_hook)(void);               /* session 13: nvn_vk_draw.c vk_lost_report (fault info, checkpoints) */
 static void vk_fatal(const char *what, VkResult r) {
     printf("nvn_vk: %s failed: %s\n", what, vk_result_name(r));
     fflush(stdout);
+    if (r == VK_ERROR_DEVICE_LOST && g_vk_lost_hook) g_vk_lost_hook();
     ExitProcess(5);
 }
 /* A call that may fail while running (present path): counted, reported a few times, the frame goes on. */

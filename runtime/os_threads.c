@@ -279,6 +279,8 @@ static void os_StartThread(Ctx *c) {
 }
 /* boot.c, on the main guest thread before the game starts: main.npdm gives it core 0 and priority 44 - 28 = 16 */
 void os_apply_main_sched(void) {
+    {   const char *e = getenv("SSBU_MAIN_PRIO");      /* TEST: the main guest thread's Windows priority (-2..2, 15 = time critical) */
+        if (e && e[0]) { int p = atoi(e); SetThreadPriority(GetCurrentThread(), p); printf("nn::os: main thread at Windows priority %d (SSBU_MAIN_PRIO)\n", p); return; } }
     if (!console_cores()) return;
     apply_sched(GetCurrentThread(), 1ull << OS_DEFAULT_CORE);
     SetThreadPriority(GetCurrentThread(), host_priority(OS_DEFAULT_PRIORITY));

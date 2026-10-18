@@ -2,6 +2,7 @@
  * call dispatch, import dispatch with tracing, and crash reporting. */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <windows.h>
 #include "runtime.h"
 #include "hostrt.h"
@@ -505,9 +506,37 @@ void guest_unimpl(uint64_t pc, uint32_t insn, const char *what) {
 }
 void guest_svc(Ctx *c, uint32_t number) { (void)c; guest_trap("svc (direct kernel call)", number); }
 
+/* Session 13: a crash also leaves a minidump next to the exe (<exe>_crash.dmp: threads, stacks, the memory they point
+ * at; not the whole 5+ GB address space), written before anything else so that a crash inside the report still leaves
+ * evidence. */
+static void crash_minidump(EXCEPTION_POINTERS *ep) {
+    typedef struct { DWORD ThreadId; EXCEPTION_POINTERS *ExceptionPointers; BOOL ClientPointers; } MDEI;
+    typedef BOOL (WINAPI *MDWD)(HANDLE, DWORD, HANDLE, int, MDEI *, void *, void *);
+    char path[MAX_PATH + 16];
+    DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+    if (!n || n >= MAX_PATH) return;
+    if (n > 4 && !_stricmp(path + n - 4, ".exe")) path[n - 4] = 0;
+    strcat(path, "_crash.dmp");
+    HMODULE dh = LoadLibraryA("dbghelp.dll");
+    MDWD f = dh ? (MDWD)(void *)GetProcAddress(dh, "MiniDumpWriteDump") : NULL;
+    if (!f) { printf("crash: no MiniDumpWriteDump (dbghelp.dll)\n"); return; }
+    HANDLE fh = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (fh == INVALID_HANDLE_VALUE) return;
+    MDEI mi = {GetCurrentThreadId(), ep, FALSE};
+    BOOL ok = f(GetCurrentProcess(), GetCurrentProcessId(), fh, 0x1000 /* WithThreadInfo */ | 0x40 /* WithIndirectlyReferencedMemory */ | 0x10 /* ScanMemory */ | 0x4 /* WithHandleData */, &mi, NULL, NULL);
+    CloseHandle(fh);
+    printf("crash: minidump %s %s\n", path, ok ? "written" : "NOT written");
+    fflush(stdout);
+}
 static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
     EXCEPTION_RECORD *er = ep->ExceptionRecord;
-    printf("\nHOST EXCEPTION 0x%08lx at host address %p\n", er->ExceptionCode, er->ExceptionAddress);
+    static volatile LONG first;
+    LONG me = (LONG)GetCurrentThreadId(), was = InterlockedCompareExchange(&first, me, 0);
+    if (was == me) TerminateProcess(GetCurrentProcess(), 4);      /* a crash inside the report itself */
+    if (was) Sleep(INFINITE);                                     /* another thread crashing meanwhile waits: the first one reports and ends the process */
+    printf("\nHOST EXCEPTION 0x%08lx at host address %p (thread %lu)\n", er->ExceptionCode, er->ExceptionAddress, GetCurrentThreadId());
+    fflush(stdout);
+    crash_minidump(ep);
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
         printf("  %s address 0x%llx\n", er->ExceptionInformation[0] == 1 ? "writing" : "reading",
                (unsigned long long)er->ExceptionInformation[1]);
@@ -528,6 +557,13 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
     }
     report_and_exit(4);
     return EXCEPTION_EXECUTE_HANDLER;
+}
+
+/* Session 13: installed at start-up and again once the graphics driver and SDL are loaded (nvn_vk.c, first present): a DLL
+ * that sets its own top-level filter would otherwise leave a crash without the report and the dump. */
+void crash_handler_install(void) {
+    LPTOP_LEVEL_EXCEPTION_FILTER prev = SetUnhandledExceptionFilter(crash_filter);
+    if (prev && prev != crash_filter) printf("crash: the top-level exception filter had been replaced (%p); set again\n", (void *)prev);
 }
 
 /* ---------------------------------------------------------------- loader */

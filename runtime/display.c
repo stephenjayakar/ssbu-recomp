@@ -69,8 +69,32 @@ static void speed_init(void) {
 }
 
 int oe_exit_request(void);                            /* nnmisc.c */
+/* Session 13: who closed the window? A 4K play session ended with "window closed by the user" right after a match and the
+ * user saw it as a crash; nothing in the runtime sends WM_CLOSE. Logged with every close request and system command
+ * that closes: the time, how the message came (InSendMessageEx: posted, sent from this thread, another thread or
+ * another process), the Alt / F4 keys, and the foreground window with its process. */
+static void close_diag(const char *what, HWND h, WPARAM w, LPARAM l) {
+    SYSTEMTIME st;
+    char fgt[128] = "", fgexe[MAX_PATH] = "?", cls[64] = "";
+    DWORD pid = 0, ism = InSendMessageEx(NULL), size = MAX_PATH;
+    HWND fg = GetForegroundWindow();
+    GetLocalTime(&st);
+    if (fg) { GetWindowTextA(fg, fgt, sizeof fgt); GetClassNameA(fg, cls, sizeof cls); GetWindowThreadProcessId(fg, &pid); }
+    if (pid) { HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid); if (ph) { QueryFullProcessImageNameA(ph, 0, fgexe, &size); CloseHandle(ph); } }
+    printf("\ndisplay: %s at %02d:%02d:%02d.%03d, frame %lld, wParam %llx lParam %llx | message %s%s%s%s | Alt %s, F4 %s | foreground window %p%s (\"%s\", class %s, process %lu %s)\n",
+           what, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, (long long)g_frames, (unsigned long long)w, (unsigned long long)l,
+           ism == ISMEX_NOSEND ? "posted (or from this thread's own code)" : (ism & ISMEX_REPLIED) ? "sent, already replied" : "sent", (ism & ISMEX_CALLBACK) ? ", callback" : "", (ism & ISMEX_NOTIFY) ? ", notify" : "",
+           ism != ISMEX_NOSEND ? ((ism & ISMEX_SEND) ? " (from another thread or process)" : "") : "",
+           (GetAsyncKeyState(VK_MENU) & 0x8000) ? "down" : "up", (GetAsyncKeyState(VK_F4) & 0x8000) ? "down" : "up",
+           (void *)fg, fg == h ? " = the game window" : "", fgt, cls, (unsigned long)pid, fgexe);
+    fflush(stdout);
+}
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_SYSCOMMAND && (w & 0xFFF0) == SC_CLOSE) close_diag("WM_SYSCOMMAND SC_CLOSE (Alt+F4, the window menu or the taskbar)", h, w, l);
+    if (m == WM_QUERYENDSESSION || m == WM_ENDSESSION) close_diag(m == WM_QUERYENDSESSION ? "WM_QUERYENDSESSION (log off / shut down)" : "WM_ENDSESSION", h, w, l);
+    if (m == WM_DESTROY) close_diag("WM_DESTROY", h, w, l);
     if (m == WM_CLOSE) {                             /* the exit request: nn::oe decides (nnmisc.c oe_exit_request) whether the game ends now or after its exit-request handling section */
+        close_diag("WM_CLOSE", h, w, l);
         printf("\nwindow closed by the user after %lld frames\n", (long long)g_frames);
         /* session 12: the window goes at once. The exit path below runs on this thread and writes the pipeline cache
          * (300-800 MB, 12 s measured on this PC): a window that stays up meanwhile stops answering, Windows offers to end
@@ -86,9 +110,20 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 static char g_title[96];
 
+/* Session 13: DPI aware before the window exists, so that a 3840x2160 monitor at 150 % scaling gets a 3840x2160 client
+ * area and swapchain (an unaware process got 2560x1440 that Windows stretched). Per-monitor v2 when Windows has it
+ * (1703+), else system aware. A failure because the process already is aware (manifest, compatibility flag) is fine. */
+static void dpi_aware(void) {
+    typedef BOOL (WINAPI *SetCtx)(HANDLE);
+    HMODULE u = GetModuleHandleA("user32.dll");
+    SetCtx f = u ? (SetCtx)(void *)GetProcAddress(u, "SetProcessDpiAwarenessContext") : NULL;
+    BOOL ok = f ? f((HANDLE)(intptr_t)-4 /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 */) : SetProcessDPIAware();
+    printf("display: DPI awareness %s (%s)\n", ok ? "set" : "not set (already set for this process, or refused)", f ? "per monitor v2" : "system");
+}
 static DWORD WINAPI window_thread(LPVOID arg) {
     (void)arg;
     WNDCLASSA wc;
+    dpi_aware();
     memset(&wc, 0, sizeof wc);
     wc.lpfnWndProc = wndproc;
     wc.hInstance = GetModuleHandleA(NULL);

@@ -42,11 +42,13 @@ static struct {
     VkPhysicalDeviceIndexTypeUint8FeaturesEXT iu8; VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT plr; VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT vad;
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT eds3;
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl;
-    const char *exts[16]; uint32_t next;
+    VkPhysicalDeviceFaultFeaturesEXT fault; int has_fault, has_ckpt;      /* session 13: what a lost device can still tell */
+    const char *exts[24]; uint32_t next;
     int has_vids, has_cbc, has_pv, has_iu8, has_plr, has_vad, has_push, has_eds3, debug;
     int has_gpl, ext_gpl, ext_so;
     VkPhysicalDeviceMemoryProperties mp;
 } D;
+static void ckpt(int compute);                     /* session 13: device-lost checkpoints (defined with vkd_init) */
 static void vkd_fail(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt); printf("nvn_vk: FATAL: "); vprintf(fmt, ap); printf("\n"); va_end(ap); fflush(stdout); ExitProcess(6);
 }
@@ -82,6 +84,12 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
      * without the pass formats, a draw only LINKS. SSBU_VK_GPL=1 turns it on (needs extended dynamic state 3 as well). */
     D.ext_gpl = has_name(dext, ndext, "VK_EXT_graphics_pipeline_library") && has_name(dext, ndext, "VK_KHR_pipeline_library"); D.ext_so = has_name(dext, ndext, "VK_EXT_shader_object");
     if (D.ext_gpl && vk_gpl_mode()) { D.exts[D.next++] = "VK_KHR_pipeline_library"; EXT(has_gpl, "VK_EXT_graphics_pipeline_library", gpl, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT) }
+    /* session 13: a 4K play session ended with VK_ERROR_DEVICE_LOST at the start of a four-fighter match. On a lost device:
+     * VK_EXT_device_fault (the fault's kind and address) and VK_NV_device_diagnostic_checkpoints (a marker after every draw
+     * and dispatch, naming the frame, the draw and the programs: the last ones the GPU passed are printed). SSBU_VK_CKPT=0
+     * leaves the markers out. */
+    EXT(has_fault, "VK_EXT_device_fault", fault, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT)
+    if (has_name(dext, ndext, "VK_NV_device_diagnostic_checkpoints") && !(getenv("SSBU_VK_CKPT") && !atoi(getenv("SSBU_VK_CKPT")))) { D.has_ckpt = 1; D.exts[D.next++] = "VK_NV_device_diagnostic_checkpoints"; }
 #undef EXT
     if (has_name(dext, ndext, "VK_KHR_push_descriptor") && !(getenv("SSBU_VK_PUSH") && !atoi(getenv("SSBU_VK_PUSH")))) { D.has_push = 1; D.exts[D.next++] = "VK_KHR_push_descriptor"; }
     vkGetPhysicalDeviceFeatures2(V.gpu, &D.f2);                    /* every supported feature of these structures is enabled */
@@ -247,6 +255,7 @@ static void slot_wait(Slot *s) {
     LONG64 t0 = tk();
     VkResult r = vkWaitForFences(V.device, 1, &s->fence, VK_TRUE, 20000000000ull);
     g_tm[0] += tk() - t0;
+    if (r == VK_ERROR_DEVICE_LOST && g_vk_lost_hook) g_vk_lost_hook();
     if (r != VK_SUCCESS) vkd_fail("a submitted command buffer did not finish within 20 s (%s): the GPU is stuck or the device is lost", vk_result_name(r));
     VKC(vkResetFences(V.device, 1, &s->fence));
     if (g_ts_on > 0) {                             /* SSBU_VK_GPUTIME=1: the GPU's own clock at the first and the last command of this buffer */
@@ -1911,6 +1920,7 @@ static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uin
     vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v->cp);
     vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v->cl, 0, 2, sets, 0, NULL);
     vkCmdDispatch(R.cmd, gx, gy, gz);
+    ckpt(1);
     if (v->ssbo_w) {                               /* what the dispatch wrote is read by later dispatches and draws of this command buffer */
         VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
@@ -2508,6 +2518,7 @@ static void exec(const Cmd *m, int depth) {
     case OP_DRAW_ARRAYS:
         { LONG64 t0 = tk(); int ok = draw_prepare((unsigned)a[0]); g_tm[8] += tk() - t0; if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); break; } }
         vkCmdDraw(R.cmd, (uint32_t)a[2], (uint32_t)a[4], (uint32_t)a[1], (uint32_t)a[3]);
+        ckpt(0);
         R.frame_draws++; nvn_front_count(0, 1);
         break;
     case OP_DRAW_ELEMENTS: {
@@ -2520,6 +2531,7 @@ static void exec(const Cmd *m, int depth) {
         { LONG64 t0 = tk(); int ok = draw_prepare((unsigned)a[0]); g_tm[8] += tk() - t0; if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); break; } }
         vkCmdBindIndexBuffer(R.cmd, ib.buf, ib.off, t == 0 ? VK_INDEX_TYPE_UINT8_EXT : t == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(R.cmd, (uint32_t)count, (uint32_t)a[6], 0, (int32_t)a[4], (uint32_t)a[5]);
+        ckpt(0);
         R.frame_draws++; nvn_front_count(0, 1);
         break;
     }
@@ -2853,6 +2865,7 @@ static void vk_present2(void *arg, int progress) {
         if (wt > 0 && frame == wt && !progress) { printf("nvn_vk_watchdog: TEST: the render thread is held %d s at frame %lld (SSBU_VK_WD_TEST)\n", ws, (long long)frame); fflush(stdout); wt = -1; Sleep((DWORD)ws * 1000); }
     }
     if (progress) goto swap;
+    { static int ch; if (!ch) { void crash_handler_install(void); ch = 1; crash_handler_install(); } }      /* the driver's DLLs are loaded by now */
     ts_frame_end();
     if (j->win) for (int i = 0; i < j->win->count && i < 8; i++) wintex_note(j->win->tex[i]);
     g_ovl.bar_arg = arg;
@@ -3202,10 +3215,59 @@ static void pcache_save(void) {
 }
 #endif
 #include "nvn_vk_wd.c"                             /* session 12: the freeze watchdog (wd_start / wd_stop) */
+static PFN_vkGetDeviceFaultInfoEXT pvkGetDeviceFaultInfoEXT;
+static PFN_vkCmdSetCheckpointNV pvkCmdSetCheckpointNV;
+static PFN_vkGetQueueCheckpointDataNV pvkGetQueueCheckpointDataNV;
+/* checkpoint marker: bit 63 dispatch, bits 40..59 frame, 20..39 vertex (or compute) program serial, 0..19 fragment program
+ * serial; a separate counter of draws in the frame would not fit, the frame and programs are enough to find the draw */
+static void ckpt(int compute) {
+    if (!pvkCmdSetCheckpointNV) return;
+    uint64_t f = (uint64_t)nvn_front_frame_next() & 0xFFFFF;
+    uint64_t a = compute ? (R.prog[5] ? (uint64_t)R.prog[5]->serial & 0xFFFFF : 0) : (R.prog[0] ? (uint64_t)R.prog[0]->serial & 0xFFFFF : 0);
+    uint64_t b = !compute && R.prog[1] ? (uint64_t)R.prog[1]->serial & 0xFFFFF : 0;
+    pvkCmdSetCheckpointNV(R.cmd, (void *)(uintptr_t)((uint64_t)compute << 63 | f << 40 | a << 20 | b));
+}
+static void vk_lost_report(void) {
+    static int once;
+    if (once++ || !V.device) return;
+    printf("nvn_vk: DEVICE LOST at frame %lld (render thread): %lld draws and %lld dispatches recorded in the frame so far\n", (long long)nvn_front_frame_next(), (long long)R.frame_draws, (long long)R.dispatches);
+    if (pvkGetDeviceFaultInfoEXT) {
+        VkDeviceFaultCountsEXT fc = {VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+        {   pvkGetDeviceFaultInfoEXT(V.device, &fc, NULL);
+            VkDeviceFaultAddressInfoEXT ad[16]; VkDeviceFaultVendorInfoEXT vi[16];
+            VkDeviceFaultInfoEXT fi = {VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+            if (fc.addressInfoCount > 16) fc.addressInfoCount = 16;
+            if (fc.vendorInfoCount > 16) fc.vendorInfoCount = 16;
+            fc.vendorBinarySize = 0;
+            fi.pAddressInfos = fc.addressInfoCount ? ad : NULL; fi.pVendorInfos = fc.vendorInfoCount ? vi : NULL;
+            VkResult r = pvkGetDeviceFaultInfoEXT(V.device, &fc, &fi);
+            printf("nvn_vk: device fault info (%s): \"%s\", %u address infos, %u vendor infos\n", vk_result_name(r), fi.description, fc.addressInfoCount, fc.vendorInfoCount);
+            for (uint32_t i = 0; i < fc.addressInfoCount; i++) printf("nvn_vk:   address info %u: type %d, address %llx, precision %llu\n", i, (int)ad[i].addressType, (unsigned long long)ad[i].reportedAddress, (unsigned long long)ad[i].addressPrecision);
+            for (uint32_t i = 0; i < fc.vendorInfoCount; i++) printf("nvn_vk:   vendor info %u: \"%s\" code %llx data %llx\n", i, vi[i].description, (unsigned long long)vi[i].vendorFaultCode, (unsigned long long)vi[i].vendorFaultData);
+        }
+    }
+    if (pvkGetQueueCheckpointDataNV) {
+        VkCheckpointDataNV cd[64];
+        uint32_t n = 64;
+        for (uint32_t i = 0; i < 64; i++) { memset(&cd[i], 0, sizeof cd[i]); cd[i].sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV; }
+        pvkGetQueueCheckpointDataNV(V.queue, &n, cd);
+        printf("nvn_vk: last checkpoints the GPU passed: %u\n", n);
+        for (uint32_t i = 0; i < n; i++) {
+            uint64_t m = (uint64_t)(uintptr_t)cd[i].pCheckpointMarker;
+            printf("nvn_vk:   stage %#x: %s, frame (low 20 bits) %llu, program #%llu%s%llu\n", (unsigned)cd[i].stage, m >> 63 ? "DISPATCH" : "draw", (unsigned long long)(m >> 40 & 0xFFFFF),
+                   (unsigned long long)(m >> 20 & 0xFFFFF), m >> 63 ? "" : " / fragment program #", m >> 63 ? 0ull : (unsigned long long)(m & 0xFFFFF));
+        }
+    }
+    fflush(stdout);
+}
 static void vkd_init(void) {
 #define X(n) n = (PFN_##n)vkGetDeviceProcAddr(V.device, #n); if (!n) vkd_fail("the device has no " #n);
     VKD(X)
 #undef X
+    if (D.has_fault && D.fault.deviceFault) pvkGetDeviceFaultInfoEXT = (PFN_vkGetDeviceFaultInfoEXT)vkGetDeviceProcAddr(V.device, "vkGetDeviceFaultInfoEXT");
+    if (D.has_ckpt) { pvkCmdSetCheckpointNV = (PFN_vkCmdSetCheckpointNV)vkGetDeviceProcAddr(V.device, "vkCmdSetCheckpointNV"); pvkGetQueueCheckpointDataNV = (PFN_vkGetQueueCheckpointDataNV)vkGetDeviceProcAddr(V.device, "vkGetQueueCheckpointDataNV"); }
+    g_vk_lost_hook = vk_lost_report;
+    printf("nvn_vk: device-lost diagnostics: fault info %s, checkpoints %s\n", pvkGetDeviceFaultInfoEXT ? "yes" : "no", pvkCmdSetCheckpointNV ? "yes (after every draw and dispatch; SSBU_VK_CKPT=0 = none)" : "no");
     vkCmdSetVertexInputEXT = (PFN_vkCmdSetVertexInputEXT)vkGetDeviceProcAddr(V.device, "vkCmdSetVertexInputEXT");
     if (D.has_push) { vkCmdPushDescriptorSetKHR = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(V.device, "vkCmdPushDescriptorSetKHR"); if (!vkCmdPushDescriptorSetKHR) D.has_push = 0; }
     if (D.has_eds3) {
