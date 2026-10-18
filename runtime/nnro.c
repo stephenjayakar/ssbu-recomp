@@ -439,7 +439,7 @@ static int attach_dll(NroModule *m) {
     HMODULE dll = NULL;
     if (!m->plugin && sky_registry() > 0) {                 /* skyline.c: a module re-lifted with the plugins' sites (nro_bin_hdr) */
         char hp[MAX_PATH * 2];
-        snprintf(hp, sizeof hp, "%.*snro_bin_hdr\%s.dll", (int)n, path, m->info->name);
+        snprintf(hp, sizeof hp, "%.*snro_bin_hdr\\%s.dll", (int)n, path, m->info->name);
         dll = LoadLibraryA(hp);
         if (dll) printf("nn::ro: %s from %s\n", m->info->name, hp);
     }
