@@ -273,25 +273,51 @@ void cxxrt_exception_init(uint64_t obj, uint64_t type, uint64_t dtor) {
 }
 const char *eh_type_name(uint64_t exception) { ExcHeader *h = exc_header(exception); return h ? cxxrt_type_name(h->type) : "?"; }
 
-/* ---- per-context state: each guest thread and each guest fiber has its own Ctx */
-typedef struct { Ctx *c; uint64_t in_flight, caught; int uncaught; } EhState;
+/* ---- per-context state: each guest thread and each guest fiber has its own Ctx
+ * A context's entry lies within EH_PROBE slots of its home slot. Contexts come and go (a guest fiber gets a new Ctx), so
+ * entries were never free again: after about 9 minutes of HDR play all 4096 slots were taken, every throw searched the
+ * whole table (the game slowed from 120 to 83 fps within 7 s) and then the insertion looked for a free slot forever under
+ * the lock (the watchdog's report of 2026-10-18: the main thread spinning in eh_throw). Now a new context takes the
+ * least recently used idle entry (nothing in flight, caught or uncaught) among its EH_PROBE slots when none is free;
+ * the slot stays taken, so the probe chains of the other contexts are unchanged, and an idle context that is looked up
+ * again simply gets a fresh (equal) entry. */
+typedef struct { Ctx *c; uint64_t in_flight, caught; int uncaught; LONG64 used; } EhState;
 #define EH_STATES 4096
+#define EH_PROBE 64
 static EhState g_eh_state[EH_STATES];
 static SRWLOCK g_eh_state_lock = SRWLOCK_INIT;
+static volatile LONG64 g_eh_clock, g_eh_reused;
 static EhState *eh_state(Ctx *c) {
-    unsigned h = (unsigned)((P64(c) >> 6) * 2654435761u) % EH_STATES;
-    for (int probe = 0; probe < EH_STATES; probe++, h = (h + 1) % EH_STATES) {       /* entries are never removed */
+    unsigned h0 = (unsigned)((P64(c) >> 6) * 2654435761u) % EH_STATES, h = h0;
+    for (int probe = 0; probe < EH_PROBE; probe++, h = (h + 1) % EH_STATES) {
         Ctx *seen = g_eh_state[h].c;
-        if (seen == c) return &g_eh_state[h];
+        if (seen == c) { g_eh_state[h].used = g_eh_clock++; return &g_eh_state[h]; }
         if (!seen) break;
     }
     AcquireSRWLockExclusive(&g_eh_state_lock);
-    for (;; h = (h + 1) % EH_STATES) {
-        if (g_eh_state[h].c == c) break;
-        if (!g_eh_state[h].c) { g_eh_state[h].c = c; break; }
+    int pick = -1, idle = -1;                         /* the least recently used idle entry */
+    h = h0;
+    for (int probe = 0; probe < EH_PROBE; probe++, h = (h + 1) % EH_STATES) {
+        EhState *e = &g_eh_state[h];
+        if (e->c == c) { pick = (int)h; break; }
+        if (!e->c) { e->c = c; pick = (int)h; break; }
+        if (!e->in_flight && !e->caught && e->uncaught <= 0 && (idle < 0 || e->used < g_eh_state[idle].used)) idle = (int)h;
     }
+    if (pick < 0) {
+        if (idle < 0) {                               /* EH_PROBE busy contexts on one chain: not seen; take the oldest */
+            h = h0; idle = (int)h0;
+            for (int probe = 0; probe < EH_PROBE; probe++, h = (h + 1) % EH_STATES) if (g_eh_state[h].used < g_eh_state[idle].used) idle = (int)h;
+            printf("C++ RUNTIME: %d contexts with exceptions on one chain: an entry in use is taken over\n", EH_PROBE);
+        }
+        EhState *e = &g_eh_state[idle];
+        e->in_flight = e->caught = 0; e->uncaught = 0;
+        e->c = c;
+        pick = idle;
+        g_eh_reused++;
+    }
+    g_eh_state[pick].used = g_eh_clock++;
     ReleaseSRWLockExclusive(&g_eh_state_lock);
-    return &g_eh_state[h];
+    return &g_eh_state[pick];
 }
 uint64_t eh_in_flight(Ctx *c) { return eh_state(c)->in_flight; }
 
