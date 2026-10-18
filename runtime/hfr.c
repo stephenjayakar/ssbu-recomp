@@ -18,7 +18,7 @@
  *                 asked for, and takes it as the cycle's N at the next cycle boundary (at once when N is 1).
  * The hook on 0x71014a2cd0 doubles its result in a battle; the hook on the step marks the battle as running and sets the
  * dirty flag whenever the N asked for is 1 (the battle's set-up writes 1 there), so the doubled N is taken even when no
- * request changes. Every other value (the cycle,
+ * request changes (not for a few steps after a slow motion of the game ends: see g_hold). Every other value (the cycle,
  * the rate, the per-update records) is the game's own work. Not done: writing N after the step returns (the objects have
  * been updated inside it by then: a cycle-end update ran with N = 1 and the next one reset each motion to a saved frame
  * that was never written: frozen fighters, measured 2026-10-15).
@@ -58,6 +58,24 @@
 int hook_install(uint64_t addr, void (*repl)(Ctx *, void *), void *user, ImportFn *orig);      /* fighter_sdk\hook_host.c (in nnro.c) */
 
 static int g_setting;                                  /* 60 or 120 once hfr_init has run */
+static unsigned g_rate = HFR_RATE;                    /* TEST: SSBU_HFR_RATE */
+/* The end of a slow motion of the game. Code of the game takes N != 1 (or N > 1) as "a slow motion runs" [SEEN: 0x7101481058,
+ * 0x71014b63c0, 0x71014b6cb0, 0x7101510978, 0x71017532e4 read N of the cycle]; the end of a stock match waits for N to be
+ * 1 again after the final hit's slow motion (N = 4) before it starts the "GAME" sequence. With N doubled the game would
+ * never see 1: the match stayed on its final hit forever (measured 2026-10-17 at 120 Hz, every stock match). So when the
+ * game's request maximum falls back to 1 after a request above 1, the hook returns 1, not 2, until the step has taken
+ * N = 1 as the cycle's N and kept it for HOLD_STEPS steps that ran with the stop word clear (a hit stop that freezes the
+ * battle often follows the final hit: the step does not take a new N while it lasts, measured 95 updates); a new request
+ * above 1 ends the hold at once. Those steps run at 60 Hz (the clock follows g_doubled_now). MEASURED (run30, 3 stock
+ * fights): N 8 -> stop 93 updates -> N 1 for 8 steps -> N 2, then the "GAME" request (90, falling to 1) and the results,
+ * every fight. The "GAME" slow motion's 90 doubles to 100 only (the step's clamp): its first cycle is 0.83 s, not 1.5. */
+#define STOP_WORD 0x71052b82e8ULL                     /* nonzero: the battle is stopped (the step skips its slow bookkeeping) */
+#define HOLD_STEPS 8
+static unsigned g_last_req = 1;                        /* the game's own request maximum at its last call (battle thread) */
+static int g_hold, g_hold_done;                        /* holding N at 1; steps of the hold with N = 1 and no stop */
+static int g_hold_steps = HOLD_STEPS;                  /* TEST: SSBU_HFR_HOLD */
+static LONG64 g_holds;
+static int g_trace;                                    /* TEST ONLY, SSBU_HFR_TRACE=1: changes of the slow state, requests above 1, the holds */
 static ImportFn g_orig_step, g_orig_max, g_orig_timer_init;
 static volatile uint64_t g_timer_comp;                  /* the rule component, from its init */
 static volatile LONG64 g_step_qpc;                     /* QueryPerformanceCounter at the last battle step */
@@ -82,7 +100,7 @@ static void slow_step_hook(Ctx *c, void *user) {
     (void)user;
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    if (!battle_running(now.QuadPart)) g_battles++;
+    if (!battle_running(now.QuadPart)) { g_battles++; g_hold = 0; g_last_req = 1; }
     if (rd8(SLOW + 5) < 2) {                           /* N asked for is 1: never a doubled value, so the game set it (a battle's set-up does, after
                                                         * its first updates: measured 2026-10-15); have the step ask the request maximum again */
         uint64_t t = rd64(SLOW_TABLE_PTR);
@@ -106,8 +124,18 @@ static void slow_step_hook(Ctx *c, void *user) {
     uint64_t tc = g_timer_comp;
     int before = tc ? (int)rd32(tc + 0x3d4) : -1;
     g_orig_step(c);
+    {   /* TEST ONLY, SSBU_HFR_TRACE=1: every change of the slow state */
+        static unsigned last = 0xffffffff; static int shown2;
+        int tr = g_trace;
+        unsigned cur = rd8(SLOW + 4) | rd8(SLOW + 5) << 8 | (rd32(STOP_WORD) ? 1u << 16 : 0);
+        if (tr && cur != last && shown2 < 400) { shown2++; last = cur; printf("hfr-trace: update %lld N %u asked %u phase %u counter %u inv %f stop %u\n", (long long)g_steps, rd8(SLOW + 4), rd8(SLOW + 5), rd8(SLOW + 6), rd32(SLOW), (double)*(float *)(uintptr_t)(SLOW + 0xc), rd32(STOP_WORD)); }
+    }
+    if (g_hold && rd8(SLOW + 4) == 1 && !rd32(STOP_WORD) && ++g_hold_done >= g_hold_steps) {
+        g_hold = 0;                                    /* the next request maximum doubles again */
+        if (g_trace) printf("hfr-trace: hold ends at update %lld\n", (long long)g_steps);
+    }
     InterlockedExchange(&g_doubled_now, rd8(SLOW + 4) >= 2);
-    if (g_doubled_now) wr32(UPDATE_RATE, HFR_RATE);   /* the battle's managers: 60 / rate frames per update (set-up writes 60 here again) */
+    if (g_doubled_now) wr32(UPDATE_RATE, g_rate);   /* the battle's managers: 60 / rate frames per update (set-up writes 60 here again) */
     if (added) {
         memcpy((void *)(uintptr_t)rb, keep, sizeof keep);
         g_added++;
@@ -126,12 +154,32 @@ static void slow_max_hook(Ctx *c, void *user) {
     QueryPerformanceCounter(&now);
     if (!battle_running(now.QuadPart)) return;
     unsigned n = (unsigned)(c->x[0] & 0xff);
+    {   static int shown3;
+        if (g_trace && n != 1 && shown3 < 200) { shown3++; printf("hfr-trace: request maximum %u (x0 %llx) at update %lld\n", n, (unsigned long long)c->x[0], (long long)g_steps); }
+    }
     if (!n) n = 1;
+    if (n == 1 && g_last_req > 1 && g_hold_steps > 0) {
+        g_hold = 1; g_hold_done = 0; g_holds++;
+        if (g_trace) printf("hfr-trace: hold starts at update %lld\n", (long long)g_steps);
+    }
+    if (n > 1) g_hold = 0;
+    g_last_req = n;
+    if (g_hold) { c->x[0] = 1; return; }
     c->x[0] = n * 2 > 100 ? 100 : n * 2;              /* the step clamps to 1..100 as well */
     g_doubled++;
 }
 
-static void timer_init_hook(Ctx *c, void *user) { (void)user; g_timer_comp = c->x[0]; g_orig_timer_init(c); }
+static void timer_init_hook(Ctx *c, void *user) {
+    (void)user;
+    g_timer_comp = c->x[0];
+    /* TEST ONLY, SSBU_HFR_TEST_TIME=<seconds>: a match without a time limit gets one (the rule's frames at *(component + 0x10)
+     * + 0x48, which the init copies to the remaining frames [SEEN 0x710157c8fc..0x710157c92c]): a test of the end by time. */
+    uint64_t rule = rd64(c->x[0] + 0x10);
+    const char *tt = getenv("SSBU_HFR_TEST_TIME");
+    if (tt && rule && !rd32(rule + 0x48)) wr32(rule + 0x48, (uint32_t)atoi(tt) * 60u);
+    g_orig_timer_init(c);
+    if (g_trace) printf("hfr-trace: match timer init: rule %llx time %u frames, remaining %d\n", (unsigned long long)rule, rule ? rd32(rule + 0x48) : 0, (int)rd32(c->x[0] + 0x3d4));
+}
 
 /* boot.c, after the static constructors, before nnMain. */
 void hfr_init(void) {
@@ -143,6 +191,9 @@ void hfr_init(void) {
     int a = hook_install(FN_SLOW_STEP, slow_step_hook, NULL, &g_orig_step), b = a ? hook_install(FN_SLOW_MAX, slow_max_hook, NULL, &g_orig_max) : 0;
     if (!a || !b) { printf("hfr: frame_rate = 120 asked for, but a hook failed (step %d, request maximum %d): 60 is used\n", a, b); return; }
     hook_install(FN_TIMER_INIT, timer_init_hook, NULL, &g_orig_timer_init);
+    if (getenv("SSBU_HFR_HOLD")) g_hold_steps = atoi(getenv("SSBU_HFR_HOLD"));      /* TEST ONLY */
+    g_trace = getenv("SSBU_HFR_TRACE") && atoi(getenv("SSBU_HFR_TRACE")) != 0;
+    if (getenv("SSBU_HFR_RATE")) g_rate = (unsigned)atoi(getenv("SSBU_HFR_RATE"));
     g_setting = 120;
     printf("hfr: frame_rate = 120: battles at 120 Hz (the engine's slow-motion divisor doubled, logic 60 steps per second), menus at 60 Hz\n");
 }
@@ -155,7 +206,7 @@ void hfr_picture(void) {
 }
 
 void hfr_report(FILE *out) {
-    if (g_setting == 120) fprintf(out, "hfr: %lld battles, %lld battle updates (%lld of them added between two of the console's), slow divisor doubled %lld times, match timer frames given back %lld\n", (long long)g_battles, (long long)g_steps, (long long)g_added, (long long)g_doubled, (long long)g_timer);
+    if (g_setting == 120) fprintf(out, "hfr: %lld battles, %lld battle updates (%lld of them added between two of the console's), slow divisor doubled %lld times, match timer frames given back %lld, ends of the game's slow motions held at N = 1 %lld\n", (long long)g_battles, (long long)g_steps, (long long)g_added, (long long)g_doubled, (long long)g_timer, (long long)g_holds);
     if (g_setting == 120 && g_upd_n[0] && g_upd_n[1])
         fprintf(out, "hfr: time from one battle step to the next: after a console update %.2f ms (%lld), after an added update %.2f ms (%lld)\n",
                 (double)g_upd_ticks[0] * 1000.0 / (double)g_qpf / (double)g_upd_n[0], (long long)g_upd_n[0], (double)g_upd_ticks[1] * 1000.0 / (double)g_qpf / (double)g_upd_n[1], (long long)g_upd_n[1]);
