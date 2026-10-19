@@ -4310,9 +4310,28 @@ static void cmd_draw_elements_inst(Ctx *c) {            /* (cmdbuf, mode, type, 
     logf_limited(&nlog, 6, "nvn_gl: DrawElementsInstanced mode %d type %d count %d index %llx x5=%d x6=%d x7=%d\n", (int)A1, (int)A2, (int)A3, (unsigned long long)A4, (int)A5, (int)A6, (int)A7);
     rec(c, OP_DRAW_ELEMENTS, 0);
 }
+/* The copy strides are state of the COMMAND BUFFER (nvnCommandBufferSetCopyRowStride / GetCopyRowStride, 0 = tight rows),
+ * but the back ends keep the last OP_ROWSTRIDE / OP_IMAGESTRIDE replayed from ANY command buffer. A Mii fighter's load
+ * (2026-10-19) copies a 1024x1024 texture to a buffer with this command buffer's strides at 0, after another command buffer
+ * had set 1280 / 460800 (a 320x360 copy): the Vulkan copy was sized for 320x360 rows and the GPU wrote past its buffer
+ * (VK_ERROR_DEVICE_LOST, a write to address 0). Every copy between a texture and a buffer is now preceded by this command
+ * buffer's own strides. Not charged to the game's command memory (the model of what the driver would write). */
+static void rec_copy_strides(Ctx *c) {
+    CmdBuf *cb = cb_get(A0);
+    for (int k = 0; k < 2; k++) {
+        size_t need = sizeof(Cmd);
+        if (cb->len + need > cb->cap) { cb->cap = (cb->cap + need) * 2 + 4096; cb->data = realloc(cb->data, cb->cap); }
+        Cmd *m = (Cmd *)(cb->data + cb->len);
+        cb->len += need;
+        memset(m, 0, sizeof *m);
+        m->op = k ? OP_IMAGESTRIDE : OP_ROWSTRIDE; m->size = (uint32_t)need;
+        m->a[0] = (uint64_t)(k ? cb->image_stride : cb->row_stride);
+    }
+}
 static void cmd_copy_buf_tex(Ctx *c) {                  /* (cmdbuf, buffer, texture, view, region, flags) */
     uint64_t view = A3, region = A4;
     Tex *t = hobj(A2, K_TEX);
+    rec_copy_strides(c);
     Cmd *m = rec(c, OP_COPY_BUF_TEX, 48);
     m->a[1] = (uint64_t)(uintptr_t)t; m->a[5] = 0;
     memset(BLOB(m), 0, 48);
@@ -4333,11 +4352,21 @@ static void cmd_copy_tex_tex(Ctx *c) {                  /* (cmdbuf, src, srcView
 static void cmd_copy_tex_buf(Ctx *c) {                  /* (cmdbuf, texture, view, region, buffer, flags) */
     uint64_t view = A2, region = A3;
     Tex *t = hobj(A1, K_TEX);
+    rec_copy_strides(c);
     Cmd *m = rec(c, OP_COPY_TEX_BUF, 48);
     m->a[0] = (uint64_t)(uintptr_t)t; m->a[3] = c->x[4];
     memset(BLOB(m), 0, 48);
     if (view) memcpy(BLOB(m), P(view), sizeof(View));
     if (region) memcpy(BLOB(m) + 24, P(region), 24);
+    {   static int on = -1, n;                         /* SSBU_COPYLOG=1 (test): the game's texture-to-buffer copies */
+        if (on < 0) on = getenv("SSBU_COPYLOG") && atoi(getenv("SSBU_COPYLOG"));
+        if (on && n++ < 200 && t) {
+            int r[6] = {0}; if (region) memcpy(r, P(region), 24);
+            printf("nvn_copylog: CopyTextureToBuffer texture %dx%dx%d format 0x%x target %d, region %d,%d,%d %dx%dx%d, buffer %llx, row stride %lld, image stride %lld, flags %llx (called from %llx)\n",
+                   t->b.width, t->b.height, t->b.depth, t->b.format, t->b.target, r[0], r[1], r[2], r[3], r[4], r[5], (unsigned long long)c->x[4],
+                   (long long)cb_get(A0)->row_stride, (long long)cb_get(A0)->image_stride, (unsigned long long)c->x[5], (unsigned long long)c->x[30]);
+        }
+    }
 }
 static void cmd_sample_mask(Ctx *c) { rec(c, OP_SAMPLEMASK, 0); }                     /* (cmdbuf, mask) */
 static void cmd_downsample(Ctx *c) { Tex *s = hobj(A1, K_TEX), *d = hobj(A2, K_TEX); Cmd *m = rec(c, OP_DOWNSAMPLE, 0); m->a[0] = (uint64_t)(uintptr_t)s; m->a[1] = (uint64_t)(uintptr_t)d; }
