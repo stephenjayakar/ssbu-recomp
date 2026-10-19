@@ -60,7 +60,7 @@ static void scan_copies(uint64_t rec) {
 int hfr_setting(void);                                /* hfr.c */
 /* SSBU_DEBUG_MATCH="p1=<fighter>,p2=<fighter>,stage=<name>,form=omega,cpu=<level>,items=off|on,time=<min>|stock=<n>" */
 static struct { int p[2]; char stage[48]; int omega, cpu, items, time, stock; char text[256]; } g_dm = {{-1, -1}, "", 0, -1, -1, -1, -1, ""};
-static char g_dm_name[2][32];
+static char g_dm_name[4][32];               /* p1, p2, and p3 / p4 (CPU players added on empty panels) */
 static int g_dm_p2type = -1, g_dm_applied, g_dm_fight, g_dm_form = -1, g_dm_hazards = -1;
 static FILE *g_dm_list;
 static uint64_t fighter_info_record(int id);
@@ -117,6 +117,7 @@ static int fighter_kind_by_name(const char *name) {
 }
 static void parse_match(const char *s) {
     snprintf(g_dm.text, sizeof g_dm.text, "%s", s);
+    g_dm_name[2][0] = g_dm_name[3][0] = 0;                /* p3 / p4 only for the line that names them */
     char buf[256]; snprintf(buf, sizeof buf, "%s", s);
     for (char *t = strtok(buf, ","); t; t = strtok(NULL, ",")) {
         char *eq = strchr(t, '='); if (!eq) continue;
@@ -124,6 +125,7 @@ static void parse_match(const char *s) {
         if (!strcmp(k, "p1")) { g_dm.p[0] = fighter_kind_by_name(v); snprintf(g_dm_name[0], sizeof g_dm_name[0], "%s", v); }
         else if (!strcmp(k, "p2") && (!strcmp(v, "cpu") || !strcmp(v, "human"))) g_dm_p2type = !strcmp(v, "cpu");
         else if (!strcmp(k, "p2")) { g_dm.p[1] = fighter_kind_by_name(v); snprintf(g_dm_name[1], sizeof g_dm_name[1], "%s", v); }
+        else if (!strcmp(k, "p3") || !strcmp(k, "p4")) snprintf(g_dm_name[k[1] - '1'], sizeof g_dm_name[0], "%s", v);
         else if (!strcmp(k, "stage")) snprintf(g_dm.stage, sizeof g_dm.stage, "%s", v);
         else if (!strcmp(k, "form")) { g_dm.omega = !strcmp(v, "omega"); g_dm_form = !strcmp(v, "omega") ? 2 : !strcmp(v, "battlefield") ? 1 : 0; }
         else if (!strcmp(k, "hazards")) g_dm_hazards = !strcmp(v, "on");
@@ -228,6 +230,19 @@ static uint64_t hash40(const char *s) {
     for (size_t i = 0; i < n; i++) { crc ^= (uint8_t)s[i]; for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1))); }
     return ((uint64_t)n << 32) | (uint32_t)~crc;
 }
+/* SSBU_DEBUG_MIIWATCH=1 (research, the Mii load crash): the function that makes the Mii model renderer's big object
+ * (0x710357b130: x0 = a shared_ptr it fills, the object is 0x97a0 bytes) is hooked; after it, a write watchpoint goes on
+ * object + 0x9768 (null at the crash in f_710357b660) and + 0x9760, so the log names whoever sets them. */
+static ImportFn g_orig_mii_make;
+static void research_mii_make(Ctx *c, void *user) {
+    (void)user;
+    uint64_t holder = c->x[0], lr = c->x[30];
+    g_orig_mii_make(c);
+    uint64_t big = rd64(holder);
+    printf("debug research: Mii renderer object %llx made (holder %llx, called from %llx); +0x9768 now %llx\n", (unsigned long long)big, (unsigned long long)holder, (unsigned long long)lr, (unsigned long long)rd64(big + 0x9768));
+    fflush(stdout);
+    if (big) { uint64_t w[2] = {big + 0x9768, big + 0x9760}; watch_set(w, 2); }
+}
 static void match_player_hook(Ctx *c, void *user) {
     (void)user;
     uint64_t st = c->x[0], rec = c->x[3]; int idx = (int)c->x[1];
@@ -237,7 +252,12 @@ static void match_player_hook(Ctx *c, void *user) {
         if (fgets(line, sizeof line, g_dm_list)) { line[strcspn(line, "\r\n")] = 0; if (line[0]) { g_dm_fight++; parse_match(line); } }
     }
     if (g_dm.stock > 0 && type_was != 3 && rd8(st + 5) == 1) wr8(st + 0xa, (uint8_t)g_dm.stock);   /* state + 5: rule kind (1 = stock), + 0xa: stocks -> record + 0x18 */
-    if (idx >= 0 && idx < 2 && g_dm_name[idx][0] && type_was != 3) {
+    if ((idx == 2 || idx == 3) && g_dm_name[idx][0]) {    /* p3 / p4: an empty panel (type 3) becomes a CPU with that fighter, colour = index */
+        wr32(st + 0x78, 1u);
+        wr8(st + 0x90, (uint8_t)idx);
+        type_was = 1;
+    }
+    if (idx >= 0 && idx < 4 && g_dm_name[idx][0] && type_was != 3) {
         char nm[64]; snprintf(nm, sizeof nm, "ui_chara_%s", g_dm_name[idx]);
         wr64(st + 0x88, 0xc100000000000000ull | hash40(nm));
         if (idx == 1 && g_dm_p2type >= 0) wr32(st + 0x78, (uint32_t)g_dm_p2type);
@@ -337,5 +357,6 @@ void debug_mode_init(void) {
         printf("debug match: hook on the player record builder %llx: id %d\n", FN_PLAYER_RECORD, hook_install(FN_PLAYER_RECORD, match_player_hook, NULL, &g_orig_player_record));
     }
     if (getenv("SSBU_DEBUG_RESEARCH")) printf("debug research: hook on the entry set-up: id %d\n", hook_install(FN_ENTRY_SETUP, research_entry_setup, NULL, &g_orig_entry_setup));
+    if (getenv("SSBU_DEBUG_MIIWATCH")) printf("debug research: hook on the Mii renderer object maker: id %d\n", hook_install(0x710357b130ull, research_mii_make, NULL, &g_orig_mii_make));
     if (getenv("SSBU_DEBUG_DUMP") || g_dm.text[0] || g_end_limit ||getenv("SSBU_DEBUG_RESEARCH") || getenv("SSBU_DEBUG_WATCHENTRY")) CreateThread(NULL, 0, dump_thread, NULL, 0, NULL);
 }
