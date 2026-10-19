@@ -266,6 +266,7 @@ static int sky_svc(Ctx *c, uint32_t n) {
     switch (n) {
     case 0x06: {                                 /* QueryMemory(MemoryInfo *out, u32 *page_info, u64 addr): w1 = page info */
         uint64_t out = c->x[0], a = c->x[2];
+        LARGE_INTEGER qt0; QueryPerformanceCounter(&qt0);
         SkySeg s;
         sky_rtld_init();
         memset((void *)(uintptr_t)out, 0, 0x28);
@@ -277,6 +278,12 @@ static int sky_svc(Ctx *c, uint32_t n) {
                 wr64(out, (uint64_t)(uintptr_t)mi.BaseAddress); wr64(out + 8, mi.RegionSize);
                 wr32(out + 0x10, mi.State == MEM_COMMIT ? 5 : 0); wr32(out + 0x18, mi.State == MEM_COMMIT ? perm : 0);   /* Heap / Unmapped */
             } else { wr64(out, a & ~0xfffull); wr64(out + 8, 0x1000); }
+        }
+        {   static int on = -1; static volatile LONG64 n, tk, mx; static volatile LONG nl;
+            if (on < 0) on = getenv("SSBU_SKY_TIMING") && atoi(getenv("SSBU_SKY_TIMING"));
+            if (on) { LARGE_INTEGER t1, f; QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&f); LONG64 d = t1.QuadPart - qt0.QuadPart; LONG64 k = InterlockedIncrement64(&n); InterlockedAdd64(&tk, d); if (d > mx) mx = d;
+                double ms = d * 1000.0 / f.QuadPart;
+                if ((ms > 1.0 && InterlockedIncrement(&nl) <= 30) || k % 5000 == 0) printf("sky-timing: svcQueryMemory #%lld of %llx from %llx: %.3f ms (average %.3f, worst %.2f), region %llx + %llx KB\n", (long long)k, (unsigned long long)a, (unsigned long long)c->x[30], ms, tk * 1000.0 / f.QuadPart / k, mx * 1000.0 / f.QuadPart, (unsigned long long)rd64(out), (unsigned long long)(rd64(out + 8) >> 10)); }
         }
         c->x[0] = 0; c->x[1] = 0;
         return 1; }
@@ -392,10 +399,35 @@ static void sky_A64InlineHook(Ctx *c) {
 }
 
 /* ---------------------------------------------------------------- function hooks */
-typedef struct SkyHook { uint64_t target, repl; ImportFn orig; uint64_t orig_guest; struct SkyHook *prev; volatile LONG64 calls; struct SkyHook *all; } SkyHook;
+typedef struct SkyHook { uint64_t target, repl; ImportFn orig; uint64_t orig_guest; struct SkyHook *prev; volatile LONG64 calls; struct SkyHook *all; volatile LONG64 tk_all, tk_orig, max_all, max_orig, origs; } SkyHook;
 static SkyHook *volatile g_sky_hooks;      /* every hook, for the report at exit */
-static void sky_hook_thunk(Ctx *c, void *user) { InterlockedIncrement64(&((SkyHook *)user)->calls); call_indirect(c, ((SkyHook *)user)->repl); }
-static void sky_hook_orig(Ctx *c, void *user) { ((SkyHook *)user)->orig(c); }
+/* SSBU_SKY_TIMING=1 (test): time inside each hook (its replacement, all of it) and inside its orig calls; at exit the
+ * hooks by time, and every orig call over 3 ms gets a line (first 60). */
+static int g_skyt = -1;
+static double g_skyt_ms;
+static LONG64 skyt_now(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+static int skyt_on(void) { if (g_skyt < 0) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_skyt_ms = 1000.0 / (double)f.QuadPart; g_skyt = getenv("SSBU_SKY_TIMING") && atoi(getenv("SSBU_SKY_TIMING")); } return g_skyt; }
+static void skyt_max(volatile LONG64 *m, LONG64 v) { LONG64 o; while ((o = *m) < v && InterlockedCompareExchange64(m, v, o) != o) {} }
+static void sky_where(uint64_t a, char *out, size_t n);
+static void sky_hook_thunk(Ctx *c, void *user) {
+    SkyHook *h = user;
+    InterlockedIncrement64(&h->calls);
+    if (!skyt_on()) { call_indirect(c, h->repl); return; }
+    LONG64 t0 = skyt_now();
+    call_indirect(c, h->repl);
+    LONG64 d = skyt_now() - t0;
+    InterlockedAdd64(&h->tk_all, d); skyt_max(&h->max_all, d);
+}
+static void sky_hook_orig(Ctx *c, void *user) {
+    SkyHook *h = user;
+    if (g_skyt <= 0) { h->orig(c); return; }
+    LONG64 t0 = skyt_now();
+    h->orig(c);
+    LONG64 d = skyt_now() - t0;
+    InterlockedAdd64(&h->tk_orig, d); InterlockedIncrement64(&h->origs); skyt_max(&h->max_orig, d);
+    static volatile LONG nslow;
+    if (d * g_skyt_ms > 3.0 && InterlockedIncrement(&nslow) <= 60) { char w[96]; sky_where(h->target, w, sizeof w); printf("sky-timing: orig of %s took %.2f ms\n", w, d * g_skyt_ms); }
+}
 
 /* mid-function hooks: a branch written at a non-entry address of main; the re-lifted code asks at that point */
 typedef struct SkyMid { uint64_t addr; SkyHook *top; struct SkyMid *next; } SkyMid;
@@ -663,6 +695,15 @@ static void sky_report(void) {
     for (int b = 0; b < SKY_IH_HASH; b++)
         for (SkyInline *e = g_sky_ih[b]; e && n < 4096; e = e->next) { rows[n].calls = e->calls; rows[n].addr = e->addr; rows[n].repl = e->cb[0]; total += e->calls; used += e->calls > 0; n++; }
     qsort(rows, (size_t)n, sizeof rows[0], sky_cmp_calls);
+    if (g_skyt > 0) {                                     /* SSBU_SKY_TIMING: the hooks by time */
+        typedef struct { double all, orig, mx_all, mx_orig; LONG64 calls, origs; uint64_t addr, repl; } TRow;
+        static TRow tr[4096]; int tn = 0;
+        for (SkyHook *h = g_sky_hooks; h && tn < 4096; h = h->all) if (h->calls) { TRow r = {h->tk_all * g_skyt_ms, h->tk_orig * g_skyt_ms, h->max_all * g_skyt_ms, h->max_orig * g_skyt_ms, h->calls, h->origs, h->target, h->repl}; tr[tn++] = r; }
+        for (int i = 0; i < tn; i++) for (int j = i + 1; j < tn; j++) if (tr[j].all > tr[i].all) { TRow t = tr[i]; tr[i] = tr[j]; tr[j] = t; }
+        printf("[skyline] hook time (SSBU_SKY_TIMING): total ms (orig ms) / calls, mean us, worst ms (worst orig ms):\n");
+        for (int i = 0; i < tn && i < 20; i++) { char w[96], r[96]; sky_where(tr[i].addr, w, sizeof w); sky_where(tr[i].repl, r, sizeof r);
+            printf("  %9.1f (%9.1f) / %9lld  %7.2f us  %6.2f (%6.2f)  %s -> %s\n", tr[i].all, tr[i].orig, (long long)tr[i].calls, tr[i].all * 1000.0 / (double)tr[i].calls, tr[i].mx_all, tr[i].mx_orig, w, r); }
+    }
     printf("[skyline] inline hooks: %d installed, %d reached, %lld times in all; most reached:\n", n, used, (long long)total);
     for (int i = 0; i < n && i < 12 && rows[i].calls; i++) {
         char w[96], r[96]; sky_where(rows[i].addr, w, sizeof w); sky_where(rows[i].repl, r, sizeof r);
