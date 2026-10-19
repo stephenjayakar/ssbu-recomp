@@ -24,7 +24,7 @@ typedef struct VStage {
     VkShaderModule mod; struct VStage *next, *next_h;
     VkPipeline lib, lib2; volatile LONG lib_state, lib2_state;      /* session 9 (SSBU_VK_GPL=2): the stage's pipeline library; lib2: a vertex stage with the empty fragment shader state */
 } VStage;
-#define MX_VK_VERSION 5u                         /* part of every hash: change it when mx_translate's Vulkan text or these records change */
+#define MX_VK_VERSION 7u                         /* part of every hash: change it when mx_translate's Vulkan text or these records change (7: forward-only code has no dispatch loop; a vertex stage with a loop writes its outputs after it) */
 typedef struct { uint32_t magic; int32_t stage, code_len; uint32_t key[4], fo; uint64_t spv, hb; uint32_t cbufs, ssbos, ssbo_w, images, dep, tex_units, in_attr, out_attr; int32_t uses_alpha, nsmp; VSmp smp[64]; } StageRec;
 typedef struct { uint32_t magic, key[4], fo, dep, tex; uint64_t vh; } VarRec;      /* ..\cache\vk\stage\<stage>_<hb>.var: the variants of one code */
 #define STAGEREC_MAGIC (0x52545356u + MX_VK_VERSION)
@@ -193,12 +193,15 @@ static VStage *vstage_new(uint64_t hb, int s, int code_len, const uint32_t *key,
     return v;
 }
 /* Any thread, no lock: fills v (in the table, state 1) from its record on disk, else with the translator and glslang. */
+static char g_ovr_path[260];                     /* TEST ONLY, SSBU_VK_GLSLOVR=<serial>,<file>: that program's stages are made from the GLSL text in <file> (records not used, not written) */
+static int ovr_serial_get(void) { static int sr = -2; if (sr == -2) { const char *e = getenv("SSBU_VK_GLSLOVR"); sr = -1; if (e && sscanf(e, "%d,%259s", &sr, g_ovr_path) != 2) sr = -1; } return sr; }
 static void vstage_build(VStage *v, const SSrc *src) {
     int s = v->stage, done = 0;
     char path[128];
     StageRec r;
     snprintf(path, sizeof path, "%s/stage/%d_%016llx.var", vkc_dir(), s, (unsigned long long)v->hb);
-    FILE *fp = fopen(path, "rb");
+    int ovr = ovr_serial_get() >= 0 && src->serial == ovr_serial_get();
+    FILE *fp = ovr ? NULL : fopen(path, "rb");
     if (fp) {
         VarRec e;
         while (!done && fread(&e, 1, sizeof e, fp) == sizeof e) {
@@ -226,6 +229,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
         else {
             uint64_t spv_hash = 0;
             if (in.screen_scale) { InterlockedIncrement64(&g_rs_stages); if (strstr(out.glsl, "mx_fcs)")) InterlockedIncrement64(&g_rs_fcs); if (strstr(out.glsl, "mx_tf(")) InterlockedIncrement64(&g_rs_tf); }
+            if (ovr) { FILE *of = fopen(g_ovr_path, "rb"); if (of) { fseek(of, 0, SEEK_END); long n = ftell(of); fseek(of, 0, SEEK_SET); char *t = malloc((size_t)n + 1); t[fread(t, 1, (size_t)n, of)] = 0; fclose(of); free(out.glsl); out.glsl = t; printf("nvn_vk: %s: GLSL from %s (SSBU_VK_GLSLOVR)\n", what, g_ovr_path); } }
             v->mod = module_from_glsl(s, out.glsl, what, &spv_hash);
             v->cbufs = out.cbufs; v->ssbos = out.ssbos; v->ssbo_w = out.ssbo_written; v->images = out.images; v->in_attr = out.in_attr; v->out_attr = out.out_attr;
             v->dep = s == 0 ? out.int_dep : 0; v->tex_units = out.tex_units; v->uses_alpha = out.uses_alpha; v->nsmp = out.nsmp;
@@ -237,7 +241,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
             }
             free(out.glsl);
             v->ok = v->mod != NULL;
-            if (v->ok) {                           /* the canonical key: only the bits the code looks at */
+            if (v->ok && !ovr) {                   /* the canonical key: only the bits the code looks at (not for a SSBU_VK_GLSLOVR test: its records would replace the real ones) */
                 VarRec e;
                 v->key[0] &= v->dep; v->key[1] &= v->dep; v->key[2] &= v->tex_units; v->key[3] &= v->tex_units;
                 v->h = fnv(fnv(v->hb, v->key, 16), &v->fo, 4);
@@ -305,6 +309,32 @@ static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo) {
     if (!st->code) return NULL;
     if (v && v->state == 2 && v->fo == fo && key_fits(s, key, v->key, v->dep, v->tex_units)) return v->ok ? v : NULL;
     if (!ssrc_of(&src, p, s)) return NULL;
+    if (ovr_serial_get() >= 0 && p->serial == ovr_serial_get() && s != 5) {      /* SSBU_VK_GLSLOVR: a variant of its own, outside the tables */
+        uint64_t hb = ssrc_hb(&src) ^ 0x6f76720000000000ULL;
+        EnterCriticalSection(&g_sh_lock); v = vstage_new(hb, s, src.code_len, key, fo); v->temp = 1; LeaveCriticalSection(&g_sh_lock);
+        vstage_build(v, &src);
+        st->vk = v; memcpy(v->local, st->local, sizeof v->local);
+        return v->ok ? v : NULL;
+    }
+    {   /* TEST ONLY, SSBU_VK_GLSLDUMP=<program serial>: the translated text and the machine code of that program's stages (vk_p<serial>_s<stage>_k<key0>.glsl / .bin in SSBU_SHOT_DIR) */
+        static int gd = -2; static uint64_t done[16]; static int nd;
+        if (gd == -2) gd = getenv("SSBU_VK_GLSLDUMP") ? atoi(getenv("SSBU_VK_GLSLDUMP")) : -1;
+        uint64_t dk = ((uint64_t)key[0] << 32 | key[1]) ^ ((uint64_t)s << 60) ^ fo; int seen = 0;
+        for (int i = 0; i < nd; i++) seen |= done[i] == dk;
+        if (gd >= 0 && p->serial == gd && !seen && nd < 16) {
+            MxIn in; MxOut out; char path[300]; const char *dir = getenv("SSBU_SHOT_DIR"); FILE *gf;
+            done[nd++] = dk; memset(&in, 0, sizeof in); memset(&out, 0, sizeof out);
+            in.stage = s; in.code = src.code; in.code_len = src.code_len; in.cdata = src.cdata; in.cdata_size = src.cdata ? src.cdata_size : 0;
+            in.int_attrs = key[0]; in.sint_attrs = key[1]; in.int_tex = key[2]; in.sint_tex = key[3]; in.force_out = fo;
+            in.target = 1; in.binding_base = 40u * (unsigned)s; in.ssbo_base = 40u * (unsigned)s + 20; in.tex_base = 40u * (unsigned)s; in.image_base = 40u * (unsigned)s + 32; in.wmask_binding = 40u * (unsigned)s + 38;
+            if (s == 1 && RS_ON) in.screen_scale = 1;
+            snprintf(path, sizeof path, "%s/vk_p%d_s%d_k%x.glsl", dir ? dir : ".", p->serial, s, key[0]);
+            if (mx_translate(&in, &out) && (gf = fopen(path, "wb")) != NULL) { fputs(out.glsl, gf); fclose(gf); }
+            free(out.glsl);
+            snprintf(path, sizeof path, "%s/vk_p%d_s%d_k%x.bin", dir ? dir : ".", p->serial, s, key[0]);
+            if ((gf = fopen(path, "wb")) != NULL) { fwrite(src.code, 1, (size_t)src.code_len, gf); if (src.cdata) fwrite(src.cdata, 1, src.cdata_size, gf); fclose(gf); }
+        }
+    }
     if (s != 5 && skip_active()) {                 /* shader_wait = skip: only what is ready */
         VStage *busy = NULL;
         uint64_t hb = ssrc_hb(&src);

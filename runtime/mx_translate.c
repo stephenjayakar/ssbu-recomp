@@ -33,6 +33,7 @@ typedef struct {
     uint32_t cbufs, in_attr, out_attr, tex_units, clip_out, ssbos;
     uint8_t regs[256], preds[8], in_comp[32], in_mode[32];
     int uses_gmem, uses_gstore, uses_cc, uses_layer_out, uses_vp_out, uses_psize, uses_lmem, insns, blocks, any_jump, uses_alpha;
+    int back_jump, structured, buffer_out;    /* a jump to an earlier word (a loop of the game's) or a computed one (BRX); structured, buffer_out: see the emission loop */
     uint8_t *reach, *leader;
     const uint8_t *base;                      /* instruction word 0 (a scheduling word) */
     uint32_t gubos;                           /* compute: uniform buffers reached through global memory */
@@ -222,12 +223,13 @@ static const char *attr_in(Mx *e, unsigned a, int vertex_reg_ok) {
 static void attr_out(Mx *e, unsigned a, const char *v) {
     unsigned c = (a >> 2) & 3;
     if (e->in->stage != MX_VERTEX) { fail(e, "attribute store", "attribute store in stage %d", e->in->stage); return; }
-    if (a >= 0x70 && a < 0x80) emit(e, " gl_Position[%u] = F(%s);", c, v);
-    else if (a >= 0x80 && a < 0x280) { e->out_attr |= 1u << ((a - 0x80) >> 4); emit(e, " out_attr%u[%u] = F(%s);", (a - 0x80) >> 4, c, v); }
+    int b = e->buffer_out;
+    if (a >= 0x70 && a < 0x80) emit(e, b ? " mx_pos[%u] = F(%s);" : " gl_Position[%u] = F(%s);", c, v);
+    else if (a >= 0x80 && a < 0x280) { e->out_attr |= 1u << ((a - 0x80) >> 4); emit(e, b ? " mx_o%u[%u] = F(%s);" : " out_attr%u[%u] = F(%s);", (a - 0x80) >> 4, c, v); }
     else if (a == 0x6c) { e->uses_psize = 1; emit(e, e->in->target == 1 ? " mx_psize = F(%s);" : " gl_PointSize = F(%s);", v); }
-    else if (a >= 0x2c0 && a < 0x2e0) { e->clip_out |= 1u << ((a - 0x2c0) >> 2); emit(e, " gl_ClipDistance[%u] = F(%s);", (a - 0x2c0) >> 2, v); }
-    else if (a == 0x64) { e->uses_layer_out = 1; emit(e, " gl_Layer = int(%s);", v); }
-    else if (a == 0x68) { e->uses_vp_out = 1; emit(e, " gl_ViewportIndex = int(%s);", v); }
+    else if (a >= 0x2c0 && a < 0x2e0) { e->clip_out |= 1u << ((a - 0x2c0) >> 2); emit(e, b ? " mx_clip[%u] = F(%s);" : " gl_ClipDistance[%u] = F(%s);", (a - 0x2c0) >> 2, v); }
+    else if (a == 0x64) { e->uses_layer_out = 1; emit(e, b ? " mx_layer = int(%s);" : " gl_Layer = int(%s);", v); }
+    else if (a == 0x68) { e->uses_vp_out = 1; emit(e, b ? " mx_vp = int(%s);" : " gl_ViewportIndex = int(%s);", v); }
     else if ((a >= 0x280 && a < 0x2c0) || (a >= 0x300 && a < 0x3a0) || a == 0x2e8) emit(e, " /* legacy output 0x%x ignored */", a);
     else fail(e, "attribute store", "store to attribute 0x%x", a);
 }
@@ -1298,13 +1300,13 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         unsigned tgt = (unsigned)((int)pc + 1 + off / 8);
         if ((tgt & 3) == 0) tgt++;
         if (MXB(i, 0, 5) == 0 || MXB(i, 0, 5) == 28) break;       /* never taken (the analysis did not follow it either) */
-        emit(e, "if (%s) { pc = %uu; continue; }", FLOW(e, MXB(i, 0, 5)), tgt);
+        emit(e, "if (%s) { pc = %uu; %s }", FLOW(e, MXB(i, 0, 5)), tgt, e->structured ? "break;" : "continue;");
         break;
     }
     case MXOP_SYNC: case MXOP_BRK: case MXOP_CONT:
         if (MXB(i, 0, 5) == 0 || MXB(i, 0, 5) == 28) break;
         if (!e->jt[pc]) { fail(e, mx_op_name[op], "%s without a matching token at word %u", mx_op_name[op], pc); break; }
-        emit(e, "if (%s) { pc = %uu; continue; }", FLOW(e, MXB(i, 0, 5)), e->jt[pc]);
+        emit(e, "if (%s) { pc = %uu; %s }", FLOW(e, MXB(i, 0, 5)), e->jt[pc], e->structured ? "break;" : "continue;");
         break;
     case MXOP_BRX: {
         int off = (int)(MXB(i, 20, 24) << 8) >> 8;
@@ -1318,7 +1320,8 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         break;
     }
     case MXOP_EXIT:
-        emit(e, "if (%s) { %s return; }", FLOW(e, MXB(i, 0, 5)), e->exitcode);
+        if (e->buffer_out) emit(e, "if (%s) { %s mx_done = true; break; }", FLOW(e, MXB(i, 0, 5)), e->exitcode);
+        else emit(e, "if (%s) { %s return; }", FLOW(e, MXB(i, 0, 5)), e->exitcode);
         break;
 
     default:
@@ -1401,6 +1404,7 @@ static void analyze(Mx *e) {
                 if (ft == 0 || ft == 28) continue;                   /* flow test never true */
                 if (tgt >= e->words) { fail(e, "BRA", "branch target %u outside the code", tgt); break; }
                 e->leader[tgt] = 1; e->any_jump = 1;
+                if (tgt <= pc) e->back_jump = 1;
                 if (nw >= cap) break;
                 wpc[nw] = tgt; wst[nw++] = (uint16_t)sid;
                 if (always && ft == 15) break;
@@ -1416,6 +1420,7 @@ static void analyze(Mx *e) {
                 unsigned tgt = s.tgt[k];
                 s.n = k;
                 e->jt[pc] = tgt; e->leader[tgt] = 1; e->any_jump = 1;
+                if (tgt <= pc) e->back_jump = 1;
                 if (tgt >= e->words) { fail(e, mx_op_name[op], "target outside the code"); break; }
                 if (nw >= cap) break;
                 wpc[nw] = tgt; wst[nw++] = (uint16_t)stk_id(e, &s);
@@ -1431,7 +1436,7 @@ static void analyze(Mx *e) {
                     e->leader[tg[k]] = 1;
                     if (nw < cap) { wpc[nw] = tg[k]; wst[nw++] = (uint16_t)sid; }
                 }
-                e->any_jump = 1;
+                e->any_jump = 1; e->back_jump = 1;
                 if (always && ft == 15) break;
                 continue;
             }
@@ -1514,9 +1519,25 @@ int mx_translate(const MxIn *in, MxOut *out) {
     }
 
     if (!e->fail) analyze(e);
-    for (unsigned pc = 1; pc < e->words && !e->fail; pc++) {
+    /* Vulkan (2026-10-19): code whose jumps all go forward is emitted as its blocks in order, each one run when pc names it
+     * ("if (pc == N) { do { .. } while (false); }"; a jump sets pc and leaves the block), not in the dispatch loop
+     * "for (;;) switch (pc)". With the loop, when the lanes of a warp took different paths (and so ran the loop a different
+     * number of times), the NVIDIA driver lost the vertices of the whole warp: HDR's Ganon's Tower waterfall wall (per-vertex
+     * dynamic lights, some of its vertices lit by a fighter effect's light) vanished for as long as the light was on. The same
+     * text as an if-chain inside the loop, or leaving the loop through a single exit, failed the same way; without the loop it
+     * drew. Code with a jump back (a loop of the game's own) or a computed jump (BRX) keeps the dispatch loop. */
+    e->structured = !e->fail && e->any_jump && !e->back_jump && in->target == 1;
+    /* A vertex stage that keeps the dispatch loop (a loop of its own) writes its outputs into locals, leaves the loop through
+     * one exit and copies them to the outputs after it: in the Ganon's Tower tests the loop also drew once no output was
+     * written inside it (the copy after a single exit, run E18). */
+    e->buffer_out = !e->fail && e->any_jump && !e->structured && in->target == 1 && in->stage == MX_VERTEX;
+    for (unsigned pc = 1, open = 0; pc < e->words && !e->fail; pc++) {
         if (!e->reach[pc]) continue;
-        if (e->leader[pc] && e->any_jump) { emit(e, "case %uu:\n", pc); e->blocks++; }
+        if (e->leader[pc] && e->any_jump) {
+            if (!e->structured) emit(e, "case %uu:\n", pc);
+            else { if (open) emit(e, "{ pc = %uu; } } while (false); }\n", pc); emit(e, "if (pc == %uu) { do {\n", pc); open = 1; }
+            e->blocks++;
+        }
         insn(e, pc, MXW(pc));
     }
     if (e->fail) {
@@ -1602,6 +1623,10 @@ int mx_translate(const MxIn *in, MxOut *out) {
             emit(&h, " gl_Position = vec4(0.0, 0.0, 0.0, 1.0);\n");
             if (vk) emit(&h, " gl_PointSize = mx_point_size;\n");
             for (unsigned n = 0; n < 32; n++) if (e->out_attr >> n & 1) emit(&h, " out_attr%u = vec4(0.0, 0.0, 0.0, 1.0);\n", n);
+            if (e->buffer_out) {
+                emit(&h, " vec4 mx_pos = vec4(0.0, 0.0, 0.0, 1.0); float mx_clip[8] = float[8](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0); int mx_layer = 0, mx_vp = 0; bool mx_done = false;\n");
+                for (unsigned n = 0; n < 32; n++) if (e->out_attr >> n & 1) emit(&h, " vec4 mx_o%u = vec4(0.0, 0.0, 0.0, 1.0);\n", n);
+            }
         }
         int any = 0;
         for (unsigned r = 0; r < 255; r++) if (e->regs[r]) { emit(&h, "%s r%u = 0u", any ? "," : " uint", r); any = 1; }
@@ -1609,13 +1634,22 @@ int mx_translate(const MxIn *in, MxOut *out) {
         any = 0;
         for (unsigned p = 0; p < 7; p++) if (e->preds[p]) { emit(&h, "%s p%u = false", any ? "," : " bool", p); any = 1; }
         if (any) emit(&h, ";\n");
-        if (e->any_jump) emit(&h, " uint pc = 1u;\n for (;;) { switch (pc) {\n");
-        size_t need = h.len + e->len + strlen(e->exitcode) + 256;
+        if (e->any_jump) emit(&h, e->structured ? " uint pc = 1u;\n" : " uint pc = 1u;\n for (;;) { switch (pc) {\n");
+        size_t need = h.len + e->len + strlen(e->exitcode) + 4096;
         res = malloc(need);
         memcpy(res, h.s, h.len);
         memcpy(res + h.len, e->s, e->len);
         size_t n = h.len + e->len;
-        if (e->any_jump) n += (size_t)sprintf(res + n, " default: %s return;\n } }\n}\n", e->exitcode);
+        if (e->any_jump && e->structured) n += (size_t)sprintf(res + n, " } while (false); }\n %s return;\n}\n", e->exitcode);
+        else if (e->any_jump && e->buffer_out) {
+            n += (size_t)sprintf(res + n, " default: %s mx_done = true; break;\n } if (mx_done) break; }\n gl_Position = mx_pos;", e->exitcode);
+            for (unsigned k = 0; k < 32; k++) if (e->out_attr >> k & 1) n += (size_t)sprintf(res + n, " out_attr%u = mx_o%u;", k, k);
+            for (unsigned k = 0; k < 8; k++) if (e->clip_out >> k & 1) n += (size_t)sprintf(res + n, " gl_ClipDistance[%u] = mx_clip[%u];", k, k);
+            if (e->uses_layer_out) n += (size_t)sprintf(res + n, " gl_Layer = mx_layer;");
+            if (e->uses_vp_out) n += (size_t)sprintf(res + n, " gl_ViewportIndex = mx_vp;");
+            n += (size_t)sprintf(res + n, "\n}\n");
+        }
+        else if (e->any_jump) n += (size_t)sprintf(res + n, " default: %s return;\n } }\n}\n", e->exitcode);
         else n += (size_t)sprintf(res + n, " %s\n}\n", e->exitcode);
         res[n] = 0;
         free(h.s);
