@@ -286,10 +286,20 @@ typedef struct { Ctx *c; uint64_t in_flight, caught; int uncaught; LONG64 used; 
 #define EH_PROBE 64
 static EhState g_eh_state[EH_STATES];
 static SRWLOCK g_eh_state_lock = SRWLOCK_INIT;
-static volatile LONG64 g_eh_clock, g_eh_reused;
+static volatile LONG64 g_eh_clock, g_eh_reused, g_eh_live, g_eh_throws;
+static int g_eh_max_probe;
+static unsigned g_eh_n = EH_STATES;                 /* slots in use: SSBU_EH_STATES=<64..4096> (test switch: a small table makes the take-over happen all the time) */
+/* A line now and then, so a long session shows the table stays bounded: while it fills (every 512 new entries), at 1, 2,
+ * 4 ... taken-over entries and every 8192 after that, and every 20000 throws (eh_throw). */
+static void eh_stats(const char *why) {
+    printf("cxxrt: %s: %lld throws; context table: %lld of %d entries taken, %lld taken over from idle contexts, longest probe %d of %d\n",
+           why, (long long)g_eh_throws, (long long)g_eh_live, g_eh_n, (long long)g_eh_reused, g_eh_max_probe, EH_PROBE);
+}
 static EhState *eh_state(Ctx *c) {
-    unsigned h0 = (unsigned)((P64(c) >> 6) * 2654435761u) % EH_STATES, h = h0;
-    for (int probe = 0; probe < EH_PROBE; probe++, h = (h + 1) % EH_STATES) {
+    static int once;
+    if (!once) { const char *e = getenv("SSBU_EH_STATES"); if (e && atoi(e) >= EH_PROBE && atoi(e) <= EH_STATES) g_eh_n = (unsigned)atoi(e); once = 1; }
+    unsigned h0 = (unsigned)((P64(c) >> 6) * 2654435761u) % g_eh_n, h = h0;
+    for (int probe = 0; probe < EH_PROBE; probe++, h = (h + 1) % g_eh_n) {
         Ctx *seen = g_eh_state[h].c;
         if (seen == c) { g_eh_state[h].used = g_eh_clock++; return &g_eh_state[h]; }
         if (!seen) break;
@@ -297,29 +307,47 @@ static EhState *eh_state(Ctx *c) {
     AcquireSRWLockExclusive(&g_eh_state_lock);
     int pick = -1, idle = -1;                         /* the least recently used idle entry */
     h = h0;
-    for (int probe = 0; probe < EH_PROBE; probe++, h = (h + 1) % EH_STATES) {
+    for (int probe = 0; probe < EH_PROBE; probe++, h = (h + 1) % g_eh_n) {
         EhState *e = &g_eh_state[h];
         if (e->c == c) { pick = (int)h; break; }
-        if (!e->c) { e->c = c; pick = (int)h; break; }
+        if (!e->c) { e->c = c; pick = (int)h; if (probe > g_eh_max_probe) g_eh_max_probe = probe; if (++g_eh_live % 512 == 0) eh_stats("table growing"); break; }
         if (!e->in_flight && !e->caught && e->uncaught <= 0 && (idle < 0 || e->used < g_eh_state[idle].used)) idle = (int)h;
     }
     if (pick < 0) {
         if (idle < 0) {                               /* EH_PROBE busy contexts on one chain: not seen; take the oldest */
             h = h0; idle = (int)h0;
-            for (int probe = 0; probe < EH_PROBE; probe++, h = (h + 1) % EH_STATES) if (g_eh_state[h].used < g_eh_state[idle].used) idle = (int)h;
-            printf("C++ RUNTIME: %d contexts with exceptions on one chain: an entry in use is taken over\n", EH_PROBE);
+            for (int probe = 0; probe < EH_PROBE; probe++, h = (h + 1) % g_eh_n) if (g_eh_state[h].used < g_eh_state[idle].used) idle = (int)h;
+            static volatile LONG n_busy;                  /* first 8 lines, then every 1024th */
+            LONG k = InterlockedIncrement(&n_busy);
+            EhState *o = &g_eh_state[idle];
+            if (k <= 8 || k % 1024 == 0)
+                printf("C++ RUNTIME: %d contexts with exceptions on one chain: an entry in use is taken over (%ld times so far; it had: in flight %llx, caught %llx, uncaught %d)\n",
+                       EH_PROBE, (long)k, (unsigned long long)o->in_flight, (unsigned long long)o->caught, o->uncaught);
         }
         EhState *e = &g_eh_state[idle];
         e->in_flight = e->caught = 0; e->uncaught = 0;
         e->c = c;
         pick = idle;
         g_eh_reused++;
+        if (!(g_eh_reused & (g_eh_reused - 1)) || g_eh_reused % 8192 == 0) eh_stats("idle entries taken over");
     }
     g_eh_state[pick].used = g_eh_clock++;
     ReleaseSRWLockExclusive(&g_eh_state_lock);
     return &g_eh_state[pick];
 }
 uint64_t eh_in_flight(Ctx *c) { return eh_state(c)->in_flight; }
+/* nnunwind.c, smashline's interpreter stub took exception `exc` (its landing code ran and returns to the interpreter's
+ * caller): the exception is over for this context. The stub's code never calls __cxa_begin_catch / __cxa_end_catch, so the
+ * context stayed "with an exception" for good (uncaught 1): the script fibers that throw L2CExceptionShutdown are new
+ * contexts every time, and in a test with a 128-slot table every slot ended up held that way (no idle entry to take over).
+ * `uncaught_before` = the count before the landing code ran. */
+void eh_stub_done(Ctx *c, uint64_t exc, int uncaught_before) {
+    EhState *st = eh_state(c);
+    st->in_flight = 0;
+    if (st->uncaught == uncaught_before && st->uncaught > 0) st->uncaught--;
+    if (st->caught == exc) { ExcHeader *h = exc_header(exc); st->caught = h ? h->next : 0; }
+}
+int eh_uncaught_count(Ctx *c) { return eh_state(c)->uncaught; }
 
 /* ---- loaded images */
 typedef struct { uint64_t base, size, hdr, table; uint32_t count; } EhImage;
@@ -560,6 +588,7 @@ void eh_throw(Ctx *c, uint64_t exception, uint64_t type, uint64_t dtor) {
     if (!h) { printf("\nC++ RUNTIME: throw of an object at 0x%llx that __cxa_allocate_exception did not create\n", (unsigned long long)exception); cxxrt_print_guest_stack(); report_and_exit(3); }
     h->type = type; h->dtor = dtor; h->refs = 1; h->handlers = 0; h->primary = 0; h->uw_class = UW_CLASS;
     eh_state(c)->uncaught++;
+    if (InterlockedIncrement64(&g_eh_throws) % 20000 == 0) eh_stats("throws");      /* the context table (see eh_state): stays bounded */
     eh_raise(c, exception, EH_RAISE_THROW, "uncaught exception");
 }
 /* Used by nncxxlib.c: throw an exception object prepared with cxxrt_exception_init, or stop when there is none. */
