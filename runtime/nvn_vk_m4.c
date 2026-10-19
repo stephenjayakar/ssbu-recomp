@@ -1930,7 +1930,43 @@ static uint64_t run_below(uint64_t a, uint64_t stop, LONG64 t0, LONG64 budget) {
     }
     return rlo;
 }
+/* The searches below read the game's memory where VirtualQuery (or a remembered run) said it was committed, on the game's
+ * thread in nvnProgramSetShaders, while the game's loading threads decommit memory (nn::os::FreeMemoryPages) at the same
+ * time: a page can go between the check and the read. That ended a play session (2026-10-18 19:46, the next match
+ * loading: access violation reading 0x256de6f0000, a page-aligned step of the search 29 MB below a pool of 1468 KB the
+ * game had just laid over its code). Every read of these searches is therefore under SEH; a fault = nothing found. */
+static LONG64 g_cs_fault;
+static int cs_fault_filter(unsigned long code) {
+    if (code != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedIncrement64(&g_cs_fault) <= 4) printf("nvn_vk_cscan: the game's memory went away during a container search (fault %lld): taken as nothing found\n", (long long)g_cs_fault);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+/* noinline: a fault inside the __try body itself is not caught by clang's SEH (only one in a function it calls) */
+static __declspec(noinline) uint64_t cont_find_scan(uint64_t control, uint64_t *size, uint64_t *neg_lo, LONG64 budget);
+static __declspec(noinline) int cont_range_scan(uint64_t above, uint64_t control, LONG64 budget);
+static __declspec(noinline) int cs_memcmp_raw(const void *a, const void *b, size_t n) { return memcmp(a, b, n); }
+static __declspec(noinline) void cs_memcpy_raw(void *d, const void *s, size_t n) { memcpy(d, s, n); }
+static int cs_memcmp(const void *a, uint64_t guest, size_t n) {      /* memcmp with the guest side under SEH: a fault = different */
+    int r = 1;
+    __try { r = cs_memcmp_raw(a, (const void *)(uintptr_t)guest, n); } __except (cs_fault_filter(GetExceptionCode())) { r = 1; }
+    return r;
+}
+static int cs_memcpy(void *d, uint64_t guest, size_t n) {            /* 1 = copied, 0 = the guest memory faulted */
+    int ok = 1;
+    __try { cs_memcpy_raw(d, (const void *)(uintptr_t)guest, n); } __except (cs_fault_filter(GetExceptionCode())) { ok = 0; }
+    return ok;
+}
 static uint64_t cont_find(uint64_t control, uint64_t *size, uint64_t *neg_lo, LONG64 budget) {
+    uint64_t r = 0;
+    __try { r = cont_find_scan(control, size, neg_lo, budget); } __except (cs_fault_filter(GetExceptionCode())) { r = 0; *neg_lo = 0; }
+    return r;
+}
+static int cont_range_empty(uint64_t above, uint64_t control, LONG64 budget) {      /* as cont_range_scan; a fault = given up (-1) */
+    int r = -1;
+    __try { r = cont_range_scan(above, control, budget); } __except (cs_fault_filter(GetExceptionCode())) { r = -1; }
+    return r;
+}
+static uint64_t cont_find_scan(uint64_t control, uint64_t *size, uint64_t *neg_lo, LONG64 budget) {
     uint64_t step = g_cscan_step, a = control & ~(step - 1), stop = control > (g_cscan_reach << 20) ? control - (g_cscan_reach << 20) : 0x10000;
     LONG64 t0 = tk();
     unsigned nstep = 0;
@@ -1972,7 +2008,7 @@ typedef struct { uint64_t lo, hi; long long frame; } NegIv;
 static NegIv g_negiv[16];
 static int g_negiv_i;
 static LONG64 g_cs_neg_hit, g_cs_neg_ext, g_cs_search;
-static int cont_range_empty(uint64_t above, uint64_t control, LONG64 budget) {      /* 1: readable and no header at a step in (above, control]; -1: gave up at the time budget (ticks, 0 = none) */
+static int cont_range_scan(uint64_t above, uint64_t control, LONG64 budget) {      /* 1: readable and no header at a step in (above, control]; -1: gave up at the time budget (ticks, 0 = none) */
     uint64_t step = g_cscan_step, a = control & ~(step - 1);
     LONG64 t0 = tk();
     unsigned nstep = 0;
@@ -2125,7 +2161,7 @@ void nvn_vk_container_seen(uint64_t control, uint64_t prog) {
     uint64_t ext_hi = 0;
     EnterCriticalSection(&g_sh_lock);
     for (int i = 0; i < g_ncont; i++) if (control - g_cont[i].base < g_cont[i].size) {
-        if (!memcmp(g_cont[i].head, (const void *)(uintptr_t)g_cont[i].base, 32)) { LeaveCriticalSection(&g_sh_lock); return; }
+        if (!cs_memcmp(g_cont[i].head, g_cont[i].base, 32)) { LeaveCriticalSection(&g_sh_lock); return; }
         g_cont[i].size = 0;                        /* the memory holds something else now */
     }
     if (g_cont_neg[ns] == control) { LeaveCriticalSection(&g_sh_lock); return; }
@@ -2198,7 +2234,7 @@ void nvn_vk_container_seen(uint64_t control, uint64_t prog) {
         void *copy = malloc((size_t)size);
         if (j && copy) {
             LONG64 tc = tk();
-            memcpy(copy, (const void *)(uintptr_t)base, (size_t)size);
+            if (!cs_memcpy(copy, base, (size_t)size)) { free(j); free(copy); EnterCriticalSection(&g_sh_lock); if (g_cont[idx].base == base) g_cont[idx].size = 0; LeaveCriticalSection(&g_sh_lock); return; }
             nvn_setsh_part[3] += tk() - tc;
             j->kind = 4; j->cont = idx + 1; j->cbase = (uint64_t)(uintptr_t)copy; j->csize = size; j->cobase = base;
             g_cont[idx].nvar = 1;
