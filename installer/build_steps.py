@@ -60,20 +60,20 @@ _last_start = [0.0]
 _stopped = [0]
 _solo = [False]          # the retry with one job: a compile that fails now gets the -O0 fallback
 _capped = set()          # pids stopped for going over the per-compile cap: their file goes straight to -O0
+_slots = [None]          # at most <jobs> compiles at once over all threads (the script modules are built several at a time)
 
 
 def gate():
-    """Wait until a compile may start: enough free memory, and 3 s after the previous start (its memory shows by then)."""
-    waited = False
+    """Wait until a compile may start: enough free memory and, when memory is getting short, 3 s after the previous start
+    (its memory shows by then; with plenty free, starts follow each other quickly: most files compile in seconds)."""
     while True:
         with _lock:
-            ok = time.time() - _last_start[0] >= 3.0 and (free_gb() >= MIN_FREE or not _running)
-            if ok:
+            free = free_gb()
+            spacing = 3.0 if free < MIN_FREE + 6 else 0.2
+            if time.time() - _last_start[0] >= spacing and (free >= MIN_FREE or not _running):
                 _last_start[0] = time.time()
                 return
-        if not waited:
-            waited = True
-        time.sleep(1.0)
+        time.sleep(0.2)
 
 
 def cap_gb():
@@ -111,6 +111,13 @@ def watchdog():
 
 def run_limited(cmd, limit):
     """build_opt.run_limited with the memory gate and the watchdog's registry."""
+    if _slots[0]:
+        with _slots[0]:
+            return _run_limited(cmd, limit)
+    return _run_limited(cmd, limit)
+
+
+def _run_limited(cmd, limit):
     gate()
     t = time.time()
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -163,13 +170,27 @@ def cmd_main(jobs):
 
 
 def cmd_nro(jobs):
+    """build_opt.cmd_nro, with several modules built at the same time (a module has only a few files: one at a time leaves
+    most jobs idle); _slots keeps the number of compilers at <jobs>."""
+    import concurrent.futures
     build_opt = patched_build_opt()
-    rc = build_opt.cmd_nro(jobs, [])
-    if rc:
+    import build_nro
+    build_nro.run_clang = build_opt.run_clang_nro
+    entries = build_nro.load_map()
+    build_nro.write_registry(entries)
+    _slots[0] = threading.BoundedSemaphore(max(1, jobs))
+    t0 = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max(1, jobs)) as pool:
+        rcs = list(pool.map(lambda e: build_nro.build_module(e, jobs, False, '-O0'), entries))
+    build_opt.report(os.path.join(HERE, 'obj_nro' + os.environ['RECOMP_NRO_SUFFIX']))
+    print('nro build: %d module(s) in %.1fs, %d failed' % (len(entries), time.time() - t0, sum(1 for r in rcs if r)), flush=True)
+    if any(rcs):
         print('some modules failed (memory or time): building what is missing with one job', flush=True)
         _solo[0] = True
-        rc = build_opt.cmd_nro(1, [])
-    return rc
+        _slots[0] = threading.BoundedSemaphore(1)
+        rcs = [build_nro.build_module(e, 1, False, '-O0') for e, r in zip(entries, rcs) if r]
+        build_opt.report(os.path.join(HERE, 'obj_nro' + os.environ['RECOMP_NRO_SUFFIX']))
+    return 1 if any(rcs) else 0
 
 
 def cmd_nro_lift(jobs):

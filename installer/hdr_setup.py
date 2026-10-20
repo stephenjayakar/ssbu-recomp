@@ -14,11 +14,12 @@ folder, and stays there.
 Steps (each one is skipped when it finished before, so starting again after a stop resumes; state in
 <install>\\hdr_setup_state.json, logs in <install>\\logs and <install>\\build\\logs):
   check      this PC: Windows x64, memory, disk, Vulkan, Microsoft C++ Build Tools (offered through winget when missing)
+  dump       your dump: exefs\\main and sdk must be Smash Ultimate 13.0.4 (build ids checked), romfs\\data.arc complete;
+             your HDR download: its 7 plugin files must be those of v0.49.11-beta (checked before any download)
   source     the port's source code into <install>\\src
   python     a private Python 3.13 (python.org embeddable package) + numpy lz4 zstandard Pillow unicorn, in <install>\\deps
   tools      LLVM/clang 23.1.2, SDL3, Vulkan-Headers, glslang, two files of suyu (self-test data), libopus
-  dump       your dump: exefs\\main and sdk must be Smash Ultimate 13.0.4 (build ids checked), romfs\\data.arc complete
-  setup      scripts/setup.py: convert, modules, tables, lift, sdk (the game code translated to C, on this PC)
+  setup     scripts/setup.py: convert, modules, tables, lift, sdk (the game code translated to C, on this PC)
   flags      tools/lifter/flags_local.py (the play build's form of the lifted code)
   compile    the game DLL: clang 23 -O2 for this PC's CPU (the longest step)
   nro        the game's script modules, the same way
@@ -98,17 +99,17 @@ MSVC_WINGET = ('winget install --id Microsoft.VisualStudio.2022.BuildTools -e --
                '--override "--passive --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"')
 HOST_WARN = '-Wno-error=incompatible-function-pointer-types -Wno-error=implicit-function-declaration -Wno-error=int-conversion'
 
-STEPS = ['check', 'source', 'python', 'tools', 'dump', 'setup', 'flags', 'compile', 'nro', 'record_exe', 'sd', 'plugins',
+STEPS = ['check', 'dump', 'source', 'python', 'tools', 'setup', 'flags', 'compile', 'nro', 'record_exe', 'sd', 'plugins',
          'record', 'sites', 'relift', 'link', 'verify', 'finish']
 TITLES = {'check': 'Check this PC', 'source': 'Source code', 'python': 'Private Python', 'tools': 'Compiler and libraries',
-          'dump': 'Check your game dump', 'setup': 'Translate the game code', 'flags': 'Prepare the translated code',
+          'dump': 'Check your game dump and HDR download', 'setup': 'Translate the game code', 'flags': 'Prepare the translated code',
           'compile': 'Compile the game (longest step)', 'nro': 'Compile the script modules', 'record_exe': 'Link a first exe',
           'sd': 'Unpack HDR', 'plugins': 'Compile the HDR plugins', 'record': 'Record HDR\'s code changes (hidden boot)',
           'sites': 'Site list', 'relift': 'Re-lift the game with HDR\'s changes', 'link': 'Link the HDR exe',
           'verify': 'Test boot (hidden)', 'finish': 'Settings, shortcut, clean-up'}
 # rough minutes on an 8-core / 16-thread PC with 32 GB (measured on the release test), scaled by jobs at run time
-EST_MIN = {'check': 0.2, 'source': 0.2, 'python': 1.5, 'tools': 3, 'dump': 0.2, 'setup': 4, 'flags': 2, 'compile': 75, 'nro': 40,
-           'record_exe': 2, 'sd': 3, 'plugins': 10, 'record': 4, 'sites': 0.1, 'relift': 15, 'link': 1, 'verify': 3, 'finish': 1}
+EST_MIN = {'check': 0.2, 'source': 0.2, 'python': 1, 'tools': 1, 'dump': 0.2, 'setup': 2, 'flags': 7, 'compile': 120, 'nro': 45,
+           'record_exe': 1, 'sd': 2, 'plugins': 4, 'record': 2, 'sites': 0.1, 'relift': 17, 'link': 1, 'verify': 3, 'finish': 1}
 USER_GAME_EXES = ('ssbu_native.exe', 'ssbu_user.exe')
 RECORD_EXE, CHECK_EXE = 'ssbu_record.exe', 'ssbu_check.exe'
 
@@ -240,12 +241,14 @@ class Installer:
 
     def build_env(self, **extra):
         """what the compile steps read (build.py / build_opt.py / build_nro.py / build_plugins.py / relift_sites.py)"""
-        return self.env(RECOMP_CLANG=self.clang, RECOMP_OPT='-O2', RECOMP_CFLAGS='-march=' + self.march, RECOMP_MARCH=self.march,
-                        RECOMP_GEN='gen_fl', RECOMP_OBJ='obj_fl23', RECOMP_DLL='ssbu_game_fl23.dll',
-                        RECOMP_HOST_OPT='-O2 -march=%s %s' % (self.march, HOST_WARN),
-                        SDL3_ROOT=os.path.join(self.deps, 'SDL3'), VULKAN_HEADERS=os.path.join(self.deps, 'Vulkan-Headers'),
-                        GLSLANG_ROOT=os.path.join(self.deps, 'glslang'), SUYU_ROOT=os.path.join(self.deps, 'suyu'),
-                        HDR_MIN_FREE_GB=str(self.a.min_free_gb), **extra)
+        e = dict(RECOMP_CLANG=self.clang, RECOMP_OPT='-O2', RECOMP_CFLAGS='-march=' + self.march, RECOMP_MARCH=self.march,
+                 RECOMP_GEN='gen_fl', RECOMP_OBJ='obj_fl23', RECOMP_DLL='ssbu_game_fl23.dll',
+                 RECOMP_HOST_OPT='-O2 -march=%s %s' % (self.march, HOST_WARN),
+                 SDL3_ROOT=os.path.join(self.deps, 'SDL3'), VULKAN_HEADERS=os.path.join(self.deps, 'Vulkan-Headers'),
+                 GLSLANG_ROOT=os.path.join(self.deps, 'glslang'), SUYU_ROOT=os.path.join(self.deps, 'suyu'),
+                 HDR_MIN_FREE_GB=str(self.a.min_free_gb))
+        e.update(extra)
+        return self.env(**e)
 
     @property
     def march(self):
@@ -350,11 +353,11 @@ class Installer:
             raise Stop('this PC has %.1f GB of memory: the build needs at least 16 GB (one file of the game takes about 11 GB to compile)' % total)
         if total < 23:
             self.log('  note: with less than 32 GB the compile runs with fewer jobs and takes longer; close other programs')
-        need = 0 if self.state['done'].get('compile') else 32
+        need = 0 if self.state['done'].get('compile') else 22
         free = disk_free_gb(self.inst)
         self.log('  disk: %.0f GB free at %s' % (free, self.inst))
         if free < need:
-            raise Stop('%.0f GB free at %s, the build needs about %d GB while it runs (about 6 GB stay after the clean-up)' % (free, self.inst, need))
+            raise Stop('%.0f GB free at %s, the build needs about %d GB while it runs (about 5 GB stay after the clean-up)' % (free, self.inst, need))
         root = os.environ.get('SystemRoot', r'C:\Windows')
         if not os.path.exists(os.path.join(root, 'System32', 'vulkan-1.dll')):
             self.log('  WARNING: Vulkan (vulkan-1.dll) was not found: install the current driver of your graphics card (NVIDIA / AMD / Intel)')
@@ -494,10 +497,42 @@ class Installer:
         arc = os.path.join(d['romfs'], 'data.arc')
         if not arc_complete(arc):
             raise Stop('%s is missing or incomplete (a dump cut short?): dump the RomFS again (with the 13.0.4 update applied)' % arc)
+        self.check_hdr_input()
         fonts = os.path.join(d['dump'], 'sysdata', 'fonts')
         self.log('  exefs: main and sdk are 13.0.4 (build ids match); romfs: data.arc %.1f GB, complete%s' % (
             os.path.getsize(arc) / 2.0 ** 30, '; system fonts: yes' if os.path.isdir(fonts) else
             '; no sysdata\\fonts (optional: without the console\'s shared fonts some text has no font)'))
+
+    def check_hdr_input(self):
+        """the 7 plugin files of the HDR download, read straight from the zip (or the folder): wrong versions stop here,
+        before anything is downloaded or unpacked"""
+        src = os.path.abspath(self.a.hdr)
+        found = {}
+        if os.path.isfile(src):
+            if not zipfile.is_zipfile(src):
+                raise Stop("%s is not a zip file: give HDR's switch-package.zip or an SD card folder" % src)
+            with zipfile.ZipFile(src) as z:
+                names = z.namelist()
+                root = hdr_root_in_zip(names)
+                if root is None:
+                    raise Stop("%s does not look like HDR's switch-package.zip (no atmosphere and ultimate folders inside)" % src)
+                for rel in HDR_PLUGINS:
+                    if root + rel in names:
+                        found[rel] = hashlib.sha256(z.read(root + rel)).hexdigest()
+        elif os.path.isdir(src):
+            root = src if os.path.isdir(os.path.join(src, 'atmosphere')) else os.path.join(src, 'sd')
+            for rel in HDR_PLUGINS:
+                p = os.path.join(root, *rel.split('/'))
+                if os.path.isfile(p):
+                    found[rel] = sha256_file(p)
+        else:
+            raise Stop('HDR download not found: %s' % src)
+        bad = ['%s %s' % (rel, 'missing' if rel not in found else 'is another build') for rel, sha in HDR_PLUGINS.items() if found.get(rel) != sha]
+        if bad and not self.a.any_hdr:
+            raise Stop('this release was built and tested with HDR %s; your HDR download does not match it:\n  %s\nGet switch-package.zip of '
+                       '%s from %s (or start with --any-hdr to try anyway: the plugin patch lists will most likely refuse another build).'
+                       % (HDR_VERSION, '\n  '.join(bad), HDR_VERSION, HDR_URL))
+        self.log('  HDR download: the 7 plugin files are those of %s%s' % (HDR_VERSION, '' if not bad else ' NOT (--any-hdr)'))
 
     def dump_paths(self):
         dump = os.path.abspath(self.a.dump)
@@ -551,9 +586,16 @@ class Installer:
         script = os.path.join(self.src, 'installer', 'build_steps.py')
         with open(os.path.join(self.work, 'ro_study', 'nro_map.json')) as f:
             total = len(json.load(f))
-        self.out('prog', (0, total, 'lifting the script modules'))
-        self.pyrun([script, 'nro-lift', str(self.jobs)], env=self.build_env(), on_line=self.counter(r'^$^', r'^\[(\d+)/\d+\]'))
-        self.pyrun(['flags_local.py', 'gen_nro_eh_o2', 'gen_nro_fl23'], env=self.build_env())
+        sub = self.state.setdefault('nro_done', [])
+        if 'lift' not in sub:                   # (both sub-steps are long on a hard disk: not repeated on a resume)
+            self.out('prog', (0, total, 'lifting the script modules'))
+            self.pyrun([script, 'nro-lift', str(self.jobs)], env=self.build_env(), on_line=self.counter(r'^$^', r'^\[(\d+)/\d+\]'))
+            sub.append('lift')
+            self.save()
+        if 'flags' not in sub:
+            self.pyrun(['flags_local.py', 'gen_nro_eh_o2', 'gen_nro_fl23'], env=self.build_env())
+            sub.append('flags')
+            self.save()
         done = {'n': 0}
 
         def on(line):
@@ -778,7 +820,7 @@ class Installer:
 
     def step_relift(self):
         common = [l for l in open(os.path.join(self.work, 'hdr_recorded_sites.log')) if '# lua2cpp_common+' in l]
-        jobs = str(max(1, min(self.jobs, 4)))
+        jobs = str(max(1, self.jobs))          # relift_sites.py starts a compile only with --min-free-gb free
         free = str(max(2.0, self.a.min_free_gb))
         self.pyrun(['relift_sites.py', 'build', 'hdr_sites.txt', '--jobs=' + jobs, '--min-free-gb=' + free], env=self.build_env(), logname='relift_main')
         if not os.path.exists(os.path.join(self.work, 'ssbu_game_hdr.dll')):
@@ -886,6 +928,12 @@ class Installer:
         self.state['inputs'] = {'dump': os.path.abspath(self.a.dump), 'hdr': os.path.abspath(self.a.hdr)}
         self.save()
         t_all = time.time()
+        if self.state['done'].get('finish'):
+            self.log('This install is complete (%s). Start the game with %s. To build it again, delete %s and start the setup again.'
+                     % (self.state['done']['finish'].get('at', ''), os.path.join(self.inst, 'Smash Ultimate HDR.bat'), self.state_file))
+            for sid in STEPS:
+                self.out('step', (sid, 'skip', 'done'))
+            return None
         for sid in STEPS:
             done = self.state['done'].get(sid)
             if done and sid not in ('check', 'source', 'tools'):          # cheap; they check what later steps rely on
@@ -898,16 +946,18 @@ class Installer:
             try:
                 getattr(self, 'step_' + sid)()
             except Stop as e:
+                self.spent(sid, time.time() - t0)
                 self.out('step', (sid, 'fail', e.msg))
                 self.log('FAILED at "%s": %s' % (TITLES[sid], e.msg))
                 self.log('Fix the problem and start the setup again with the same install folder: finished steps are skipped.')
                 return e
             except Exception as e:      # an unexpected error: the traceback goes to the log
+                self.spent(sid, time.time() - t0)
                 self.out('step', (sid, 'fail', str(e)))
                 self.log(traceback.format_exc())
                 self.log('FAILED at "%s" (unexpected error above). Start the setup again to resume.' % TITLES[sid])
                 return Stop(str(e))
-            secs = time.time() - t0
+            secs = time.time() - t0 + self.state.setdefault('spent', {}).pop(sid, 0)       # earlier, stopped tries of this step count too
             self.state['done'][sid] = {'secs': round(secs, 1), 'at': time.strftime('%Y-%m-%d %H:%M')}
             self.save()
             self.out('step', (sid, 'done', fmt_secs(secs)))
@@ -917,6 +967,11 @@ class Installer:
             fmt_secs(time.time() - t_all), os.path.join(self.inst, 'Smash Ultimate HDR.bat')))
         self.log('The first matches stutter while the shaders of this PC are made (once; they are kept in build\\cache).')
         return None
+
+    def spent(self, sid, secs):
+        sp = self.state.setdefault('spent', {})
+        sp[sid] = round(sp.get(sid, 0) + secs, 1)
+        self.save()
 
     def cancel(self):
         self.cancelled = True
@@ -1051,8 +1106,8 @@ def gui(a):
 
     intro = ('Builds Super Smash Bros. Ultimate %s with HewDraw Remix %s as a native Windows game, on this PC, from your own '
              'game dump and your own HDR download. Nothing of the game or of HDR is in this program.\n'
-             'Needs: the Microsoft C++ Build Tools, 16 GB of memory (32 GB recommended), about 35 GB of free disk while it '
-             'builds (about 6 GB stay), an internet connection for the open-source tools, and 2 to 4 hours (it can be '
+             'Needs: the Microsoft C++ Build Tools, 16 GB of memory (32 GB recommended), about 22 GB of free disk while it '
+             'builds (about 5 GB stay), an internet connection for the open-source tools, and 3 to 4 hours (it can be '
              'stopped and resumed).' % (GAME_VERSION, HDR_VERSION))
     tk.Label(root, text=intro, wraplength=950, justify='left').pack(fill='x', padx=10, pady=(8, 4))
     form = tk.Frame(root)
@@ -1073,7 +1128,7 @@ def gui(a):
     opts = tk.Frame(root)
     opts.pack(fill='x', padx=10, pady=4)
     tk.Checkbutton(opts, text='Desktop shortcut "Smash Ultimate HDR"', variable=v_short).pack(side='left')
-    tk.Checkbutton(opts, text='Delete the build files when done (frees about 25 GB)', variable=v_clean).pack(side='left', padx=12)
+    tk.Checkbutton(opts, text='Delete the build files when done (frees about 12 GB)', variable=v_clean).pack(side='left', padx=12)
     tk.Label(opts, text='Compile jobs:').pack(side='left')
     tk.Spinbox(opts, from_=1, to=64, textvariable=v_jobs, width=4).pack(side='left')
     tk.Label(root, text='HDR download: %s (asset switch-package.zip)' % HDR_URL, fg='#555').pack(anchor='w', padx=10)
@@ -1201,7 +1256,7 @@ def main():
     ap.add_argument('--exe-name', help='name of the game exe (default ssbu_native.exe)')
     ap.add_argument('--no-shortcut', action='store_true')
     ap.add_argument('--shortcut-dir', help='make the shortcut there instead of on the desktop')
-    ap.add_argument('--keep-build-files', action='store_true', help='keep the intermediate build files (about 25 GB)')
+    ap.add_argument('--keep-build-files', action='store_true', help='keep the intermediate build files (about 12 GB)')
     ap.add_argument('--no-dpi-flag', action='store_true', help='do not mark the exe as DPI-aware in the registry (HKCU)')
     ap.add_argument('--downloads', help='folder for the downloaded archives (default <install>\\downloads, removed at the end)')
     ap.add_argument('--any-hdr', action='store_true', help='go on with another HDR version (untested)')
