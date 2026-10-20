@@ -68,3 +68,7 @@ deps/
 # local configuration
 config/
 __pycache__/
+
+# the setup exe of installer/build_exe.py
+dist/
+build_exe_tmp/
