@@ -30,11 +30,13 @@ sys.path.insert(0, WORK)
 import plugin_map  # noqa: E402
 
 CLANG = os.environ.get('RECOMP_CLANG', r'C:\Program Files\LLVM\bin\clang.exe')
-LOCK = r'C:\tmp\ssbu\heavy.lock'
-OPT_FLAGS = ['-O2', '-ffp-contract=off', '-march=znver2']
+LOCK = os.environ.get('RECOMP_LOCK', r'C:\tmp\ssbu\heavy.lock')      # RECOMP_LOCK= (empty) or a missing folder: no lock
+OPT_FLAGS = ['-O2', '-ffp-contract=off', '-march=' + os.environ.get('RECOMP_MARCH', 'znver2')]      # RECOMP_MARCH: the CPU to compile for
 
 
 def take_lock(what):
+    if not LOCK or not os.path.isdir(os.path.dirname(LOCK)):
+        return
     while True:
         try:
             fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -54,6 +56,8 @@ def take_lock(what):
 
 
 def drop_lock():
+    if not LOCK:
+        return
     try:
         os.remove(LOCK)
     except OSError:

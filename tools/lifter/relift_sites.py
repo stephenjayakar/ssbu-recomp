@@ -55,7 +55,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 KINDS = {'patch': 1, 'inline': 2, 'midhook': 3, 'dynimm': 4, 'jtable': 5, 'noinline': 6}
-LOCK = r'C:\tmp\ssbu\heavy.lock'
+# the shared build lock of the development PC; RECOMP_LOCK=<file> names another, RECOMP_LOCK= (empty) or a missing folder = no lock
+LOCK = os.environ.get('RECOMP_LOCK', r'C:\tmp\ssbu\heavy.lock')
 DEFAULT_CLANG = r'C:\Program Files\LLVM\bin\clang.exe'
 
 
@@ -319,6 +320,8 @@ def proc_mem(p):
 
 
 def take_lock(purpose):
+    if not LOCK or not os.path.isdir(os.path.dirname(LOCK)):
+        return
     while True:
         try:
             fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -340,6 +343,8 @@ def take_lock(purpose):
 
 
 def drop_lock():
+    if not LOCK:
+        return
     try:
         os.remove(LOCK)
     except OSError:
@@ -350,7 +355,7 @@ def drop_lock():
 def base_settings(base_obj, module=None):
     """compiler, -O level, extra flags and the per-file optnone limit / whole-file -O0 of the base set's report
     (a module's report is obj_nro_<suffix>/_opt_report.txt, its lines `<module>/c_XXXX.c`)"""
-    clang, opt, extra = os.environ.get('RECOMP_CLANG', DEFAULT_CLANG), '-O2', ['-ffp-contract=off', '-march=znver2']
+    clang, opt, extra = os.environ.get('RECOMP_CLANG', DEFAULT_CLANG), '-O2', ['-ffp-contract=off', '-march=' + os.environ.get('RECOMP_MARCH', 'znver2')]
     per_file = {}
     rep = os.path.join(os.path.dirname(base_obj) if module else base_obj, '_opt_report.txt')
     prefix = re.escape(module + '/') if module else ''
